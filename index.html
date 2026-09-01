@@ -2,7 +2,7 @@
 <html lang="zh-TW">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>小排點名系統</title>
   
   <!-- 行動裝置 PWA / 主畫面獨立 App 體驗設定 -->
@@ -20,31 +20,34 @@
     html, body {
       width: 100%;
       height: 100%;
+      margin: 0;
+      padding: 0;
       overflow: hidden;
       background-color: #0d9488;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
     
+    /* 
+      使用 inset: 0 確保容器牢牢貼合瀏覽器當前真實可視區域（避免被 Chrome/Brave 底部工具列推擠遮擋）
+    */
     .app-container {
       position: fixed;
       top: 0;
       left: 0;
+      right: 0;
+      bottom: 0;
       width: 100%;
-      height: 100dvh;
-      height: 100vh;
+      height: 100%;
       overflow: hidden;
     }
 
-    /* 
-      透過 iframe 嵌入時，Google 本身就不會放入警告橫幅！
-      因此直接設定 100% 滿版，無須任何負邊距位移。
-    */
     .gas-frame {
+      position: absolute;
+      top: 0;
+      left: 0;
       width: 100%;
-      height: 100dvh;
-      height: 100vh;
-      margin: 0;
-      border: none;
+      height: 100%;
+      border: 0;
       display: block;
       background: white;
     }
@@ -54,6 +57,8 @@
       position: fixed;
       top: 0;
       left: 0;
+      right: 0;
+      bottom: 0;
       width: 100%;
       height: 100%;
       background: linear-gradient(135deg, #0d9488, #0f766e);

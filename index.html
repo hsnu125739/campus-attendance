@@ -25,7 +25,6 @@
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
     
-    /* 容器：撐滿畫面並裁切 Google 警告橫幅 */
     .app-container {
       position: fixed;
       top: 0;
@@ -37,14 +36,14 @@
     }
 
     /* 
-      iframe 核心裁切樣式：
-      將 Google 橫幅 (-38px) 向上推擠出可視區域外
+      透過 iframe 嵌入時，Google 本身就不會放入警告橫幅！
+      因此直接設定 100% 滿版，無須任何負邊距位移。
     */
     .gas-frame {
       width: 100%;
-      height: calc(100dvh + 38px);
-      height: calc(100vh + 38px);
-      margin-top: -38px;
+      height: 100dvh;
+      height: 100vh;
+      margin: 0;
       border: none;
       display: block;
       background: white;

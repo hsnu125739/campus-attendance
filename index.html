@@ -120,6 +120,42 @@
       }
     }
     setTimeout(handleFrameLoad, 3500);
+
+    // ===== 行動端鍵盤自適應（解決 Modal 點擊偏移 + 鍵盤浮動）=====
+    (function setupKeyboardAdaptive() {
+      if (!window.visualViewport || !('ontouchstart' in window)) return;
+
+      var frame = document.getElementById('gasFrame');
+      if (!frame) return;
+
+      var MIN_HEIGHT = 280;
+      var rafId = null;
+
+      function syncViewport() {
+        rafId = null;
+        var vv = window.visualViewport;
+        var layoutHeight = window.innerHeight;
+        var diff = layoutHeight - vv.height;
+
+        if (diff > layoutHeight * 0.15) {
+          // 鍵盤升起：縮小 iframe 到可視區域
+          var h = Math.max(vv.height, MIN_HEIGHT);
+          frame.style.height = h + 'px';
+          frame.style.top = vv.offsetTop + 'px';
+        } else {
+          // 鍵盤收起：恢復滿版
+          frame.style.height = '100%';
+          frame.style.top = '0';
+        }
+      }
+
+      function requestSync() {
+        if (!rafId) rafId = requestAnimationFrame(syncViewport);
+      }
+
+      window.visualViewport.addEventListener('resize', requestSync);
+      window.visualViewport.addEventListener('scroll', requestSync);
+    })();
   </script>
 </body>
 </html>

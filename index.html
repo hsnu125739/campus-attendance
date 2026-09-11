@@ -138,14 +138,12 @@
         var diff = layoutHeight - vv.height;
 
         if (diff > layoutHeight * 0.15) {
-          // 鍵盤升起：縮小 iframe 到可視區域
-          var h = Math.max(vv.height, MIN_HEIGHT);
+          // 鍵盤升起：iframe 從頂端延伸到鍵盤正上方
+          var h = Math.max(vv.offsetTop + vv.height, MIN_HEIGHT);
           frame.style.height = h + 'px';
-          frame.style.top = vv.offsetTop + 'px';
         } else {
           // 鍵盤收起：恢復滿版
           frame.style.height = '100%';
-          frame.style.top = '0';
         }
       }
 

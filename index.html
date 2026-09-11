@@ -2,7 +2,7 @@
 <html lang="zh-TW">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
   <title>小排點名系統</title>
   
   <!-- 行動裝置 PWA / 主畫面獨立 App 體驗設定 -->
@@ -23,7 +23,8 @@
       margin: 0;
       padding: 0;
       overflow: hidden;
-      background-color: #0d9488;
+      position: fixed;
+      background-color: #ffffff;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
     
@@ -131,15 +132,22 @@
       var MIN_HEIGHT = 280;
       var rafId = null;
 
+      function lockScroll() {
+        if (window.scrollY !== 0 || window.scrollX !== 0) {
+          window.scrollTo(0, 0);
+        }
+      }
+
       function syncViewport() {
         rafId = null;
+        lockScroll();
         var vv = window.visualViewport;
         var layoutHeight = window.innerHeight;
         var diff = layoutHeight - vv.height;
 
         if (diff > layoutHeight * 0.15) {
-          // 鍵盤升起：iframe 從頂端延伸到鍵盤正上方
-          var h = Math.max(vv.offsetTop + vv.height, MIN_HEIGHT);
+          // 鍵盤升起：iframe 緊貼可視區域高度
+          var h = Math.max(vv.height, MIN_HEIGHT);
           frame.style.height = h + 'px';
         } else {
           // 鍵盤收起：恢復滿版
@@ -151,6 +159,7 @@
         if (!rafId) rafId = requestAnimationFrame(syncViewport);
       }
 
+      window.addEventListener('scroll', lockScroll, { passive: true });
       window.visualViewport.addEventListener('resize', requestSync);
       window.visualViewport.addEventListener('scroll', requestSync);
     })();

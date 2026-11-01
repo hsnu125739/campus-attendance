@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+
+<html lang="zh-TW">
+
+<head>
+
+  <meta charset="UTF-8">
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
+
+  <title>台南青少年排點名</title>
+  <style>
+    /* @INJECT_STYLES */
+  </style>
+</head>
+
+<body>
+
+  <!-- Background Save Indicator -->
+
+  <div id="pending-save">⏳ 儲存中...</div>
+
+  <!-- Loading Overlay -->
+
+  <div class="loading-overlay" id="loading">
+
+    <div class="spinner"></div>
+  </div>
+
+  <!-- Toast Container -->
+
+  <div class="toast-container" id="toast-container"></div>
+
+  <!-- ===== Modal：新增校園 ===== -->
+  <div class="modal-backdrop" id="modal-add-campus">
+    <div class="modal">
+      <h3>➕ 新增小排</h3>
+      <label class="modal-label">小排名稱</label>
+      <input class="modal-input" id="input-campus-name" placeholder="請輸入小排名稱" maxlength="20" />
+      <label class="modal-label">小排類別</label>
+      <div class="category-selector" id="add-campus-category-selector">
+        <button type="button" class="category-btn" data-cat="國中" onclick="selectCampusCategory('add', '國中')">國中</button>
+        <button type="button" class="category-btn selected" data-cat="高中" onclick="selectCampusCategory('add', '高中')">高中</button>
+        <button type="button" class="category-btn" data-cat="社區排" onclick="selectCampusCategory('add', '社區排')">社區排</button>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-outline btn-sm" onclick="closeModal('modal-add-campus')">取消</button>
+        <button class="btn btn-primary btn-sm" onclick="handleAddCampus()">新增</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Modal：新增人位 ===== -->
+
+  <div class="modal-backdrop" id="modal-add-member">
+
+    <div class="modal">
+
+      <h3>➕ 新增人位</h3>
+
+      <input class="modal-input" id="input-member-name" placeholder="姓名" maxlength="20" />
+
+      <div id="add-campus-group-box" style="display:none;margin-bottom:12px;">
+        <label class="defaults-label">所屬校園排：</label>
+        <select class="modal-select" id="add-member-other-campus" onchange="handleSelectCampusInModal('add')">
+          <option value="">無 / 其他</option>
+        </select>
+      </div>
+
+      <div id="add-stage-box" style="margin-bottom:12px;">
+        <label class="defaults-label">學段：</label>
+        <div class="stage-selector" id="add-stage-selector">
+          <button type="button" class="stage-btn" data-stage="高中" onclick="selectStage('add', '高中')">高中</button>
+          <button type="button" class="stage-btn" data-stage="國中" onclick="selectStage('add', '國中')">國中</button>
+          <button type="button" class="stage-btn" data-stage="其他" onclick="selectStage('add', '其他')">其他</button>
+        </div>
+      </div>
+
+      <div class="role-selector" id="role-selector">
+
+        <button class="role-btn role-brother" data-role="弟兄" onclick="selectRole(this)">弟兄</button>
+
+        <button class="role-btn role-sister" data-role="姊妹" onclick="selectRole(this)">姊妹</button>
+
+        <button class="role-btn role-mbro" data-role="男界朋友" onclick="selectRole(this)">男界朋友</button>
+
+        <button class="role-btn role-msis" data-role="女界朋友" onclick="selectRole(this)">女界朋友</button>
+
+        <button class="role-btn role-server" data-role="服事者/家長" onclick="selectRole(this)">服事者/家長</button>
+      </div>
+
+      <label class="defaults-label">設定預設參與項目（套用時自動勾選）：</label>
+
+      <div class="defaults-selector" id="add-defaults-selector">
+
+        <button type="button" class="default-toggle-btn" data-type="出席" onclick="toggleDefaultSelection(this)">出席</button>
+
+        <button type="button" class="default-toggle-btn" data-type="禱告" onclick="toggleDefaultSelection(this)">禱告</button>
+
+        <button type="button" class="default-toggle-btn" data-type="傳福音" onclick="toggleDefaultSelection(this)">出訪</button>
+      </div>
+
+      <div class="modal-actions">
+
+        <button class="btn btn-outline btn-sm" onclick="closeModal('modal-add-member')">取消</button>
+
+        <button class="btn btn-primary btn-sm" onclick="handleAddMember()">新增</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Modal：編輯人位 ===== -->
+
+  <div class="modal-backdrop" id="modal-edit-member">
+
+    <div class="modal">
+
+      <h3>✏️ 編輯人位</h3>
+
+      <input type="hidden" id="edit-member-oldname" />
+
+      <input class="modal-input" id="edit-member-name" placeholder="姓名" maxlength="20" />
+
+      <div id="edit-campus-group-box" style="display:none;margin-bottom:12px;">
+        <label class="defaults-label">所屬校園排：</label>
+        <select class="modal-select" id="edit-member-other-campus" onchange="handleSelectCampusInModal('edit')">
+          <option value="">無 / 其他</option>
+        </select>
+      </div>
+
+      <div id="edit-stage-box" style="margin-bottom:12px;">
+        <label class="defaults-label">學段：</label>
+        <div class="stage-selector" id="edit-stage-selector">
+          <button type="button" class="stage-btn" data-stage="高中" onclick="selectStage('edit', '高中')">高中</button>
+          <button type="button" class="stage-btn" data-stage="國中" onclick="selectStage('edit', '國中')">國中</button>
+          <button type="button" class="stage-btn" data-stage="其他" onclick="selectStage('edit', '其他')">其他</button>
+        </div>
+      </div>
+
+      <div class="role-selector" id="edit-role-selector">
+
+        <button class="role-btn role-brother" data-role="弟兄" onclick="selectEditRole(this)">弟兄</button>
+
+        <button class="role-btn role-sister" data-role="姊妹" onclick="selectEditRole(this)">姊妹</button>
+
+        <button class="role-btn role-mbro" data-role="男界朋友" onclick="selectEditRole(this)">男界朋友</button>
+
+        <button class="role-btn role-msis" data-role="女界朋友" onclick="selectEditRole(this)">女界朋友</button>
+
+        <button class="role-btn role-server" data-role="服事者/家長" onclick="selectEditRole(this)">服事者/家長</button>
+      </div>
+
+      <label class="defaults-label">設定預設參與項目（套用時自動勾選）：</label>
+
+      <div class="defaults-selector" id="edit-defaults-selector">
+
+        <button type="button" class="default-toggle-btn" data-type="出席" onclick="toggleDefaultSelection(this)">出席</button>
+
+        <button type="button" class="default-toggle-btn" data-type="禱告" onclick="toggleDefaultSelection(this)">禱告</button>
+
+        <button type="button" class="default-toggle-btn" data-type="傳福音" onclick="toggleDefaultSelection(this)">出訪</button>
+      </div>
+
+      <div class="modal-actions" style="justify-content: space-between;">
+
+        <button class="btn btn-danger btn-sm" onclick="handleDeleteFromEdit()">刪除</button>
+
+        <div style="display:flex;gap:8px;">
+
+          <button class="btn btn-outline btn-sm" onclick="closeModal('modal-edit-member')">取消</button>
+
+          <button class="btn btn-primary btn-sm" onclick="handleEditMember()">儲存</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Modal：確認動作 ===== -->
+
+  <div class="modal-backdrop" id="modal-confirm">
+
+    <div class="modal">
+
+      <h3 id="confirm-title">確認刪除</h3>
+
+      <p class="confirm-text" id="confirm-message"></p>
+
+      <div class="modal-actions">
+
+        <button class="btn btn-outline btn-sm" onclick="closeModal('modal-confirm')">取消</button>
+
+        <button class="btn btn-danger btn-sm" id="confirm-btn" onclick="handleConfirm()">刪除</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Modal：編輯小排 ===== -->
+  <div class="modal-backdrop" id="modal-rename-campus">
+    <div class="modal">
+      <h3>✏️ 編輯小排</h3>
+      <label class="modal-label">小排名稱</label>
+      <input class="modal-input" id="input-rename-campus" placeholder="請輸入小排名稱" maxlength="20" />
+      <input type="hidden" id="rename-campus-id" />
+      <label class="modal-label">小排類別</label>
+      <div class="category-selector" id="edit-campus-category-selector">
+        <button type="button" class="category-btn" data-cat="國中" onclick="selectCampusCategory('edit', '國中')">國中</button>
+        <button type="button" class="category-btn" data-cat="高中" onclick="selectCampusCategory('edit', '高中')">高中</button>
+        <button type="button" class="category-btn" data-cat="社區排" onclick="selectCampusCategory('edit', '社區排')">社區排</button>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-outline btn-sm" onclick="closeModal('modal-rename-campus')">取消</button>
+        <button class="btn btn-primary btn-sm" onclick="handleRenameCampus()">確認</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Modal：恢復封存校園 ===== -->
+
+  <div class="modal-backdrop" id="modal-restore-campus">
+
+    <div class="modal">
+
+      <h3>📂 恢復已封存小排</h3>
+
+      <p class="confirm-text" style="text-align:left;font-size:13px;color:#64748b;margin-bottom:12px;">
+
+        以下為目前已封存的小排，點擊「恢復」即可重新顯示於首頁：
+
+      </p>
+
+      <div id="restore-campus-list" style="max-height:240px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;margin-bottom:16px;">
+
+        <!-- 動態填充 -->
+      </div>
+
+      <div class="modal-actions">
+
+        <button class="btn btn-outline btn-sm" onclick="closeModal('modal-restore-campus')">關閉</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 主視圖頂部標題與極簡切換分頁列 -->
+
+  <div id="main-view-header">
+
+    <div class="header">
+
+      <h1 id="main-app-title">📋 青少年排點名&nbsp</h1>
+
+      <div class="header-sub" id="main-app-subtitle">選擇小排開始點名</div>
+    </div>
+
+    <div class="top-nav-bar" id="top-nav-bar">
+
+      <button class="nav-tab active" id="tab-nav-home" onclick="switchMainTab('home')">
+
+        <span>📋 小排點名</span>
+
+      </button>
+
+      <button class="nav-tab" id="tab-nav-stats" onclick="switchMainTab('stats')">
+
+        <span>📊 數據趨勢</span>
+
+      </button>
+    </div>
+  </div>
+
+  <!-- ===== 頁面 1：首頁（校園清單） ===== -->
+
+  <div id="page-home">
+
+    <div class="container">
+
+      <div id="campus-list">
+
+        <!-- 動態填充 -->
+      </div>
+
+      <div class="home-footer">
+
+        <button class="btn btn-outline btn-sm" id="btn-manage-campus" onclick="enterCampusEditMode()">
+
+          ⚙️ 管理小排
+
+        </button>
+
+        <button class="btn btn-primary btn-sm" id="btn-save-campus" style="display:none;" onclick="exitCampusEditMode()">
+
+          ✅ 完成管理
+
+        </button>
+
+        <button class="btn btn-primary btn-sm" id="btn-add-campus" style="display:none;" onclick="openModal('modal-add-campus')">
+
+          ➕ 新增小排
+
+        </button>
+
+        <button class="btn btn-outline btn-sm" id="btn-restore-campus" style="display:none;" onclick="openRestoreCampusModal()">
+
+          📂 恢復封存小排
+
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 頁面 3：各校數據趨勢統計 ===== -->
+  <div id="page-stats" style="display:none;">
+    <div class="stats-container">
+
+      <!-- 1. 頂部控制列：日期模式與校園切換 -->
+      <div class="stats-controls">
+        <div class="stats-select-group">
+          <label style="font-size:0.85rem; font-weight:600; color:var(--gray-600);">區間：</label>
+          <select class="stats-select" id="stats-range-select" onchange="handleStatsRangeModeChange()">
+            <option value="W10" selected>⏱️ 最近十週</option>
+            <option value="SEMESTER_CURRENT">🎓 當前學期</option>
+            <option value="CUSTOM">📅 自訂範圍...</option>
+          </select>
+        </div>
+
+        <div class="stats-select-group">
+          <label style="font-size:0.85rem; font-weight:600; color:var(--gray-600);">小排：</label>
+          <select class="stats-select" id="stats-campus-select" onchange="handleStatsCampusChange()">
+            <option value="ALL">🌟 全體小排匯總</option>
+            <!-- 動態填入各校 -->
+          </select>
+        </div>
+      </div>
+
+      <!-- 自訂日期範圍輸入列（單行緊湊版） -->
+      <div id="stats-custom-range-bar" style="display:none; background:white; padding:8px 12px; border-radius:var(--radius); border:1px solid var(--gray-200); box-shadow:var(--shadow-sm); align-items:center; gap:6px;">
+        <input type="date" id="stats-custom-start" class="stats-select" style="flex:1; min-width:0; padding:5px 6px; font-size:0.8rem;" />
+        <span style="color:var(--gray-400); font-weight:bold;">～</span>
+        <input type="date" id="stats-custom-end" class="stats-select" style="flex:1; min-width:0; padding:5px 6px; font-size:0.8rem;" />
+        <button type="button" class="btn btn-primary btn-sm" style="padding:5px 12px; font-size:0.8rem; white-space:nowrap;" onclick="applyCustomDateRange()">套用</button>
+      </div>
+
+      <!-- 2. 3 大 KPI 關鍵指標卡片（首屏即刻掌握關鍵數字） -->
+      <div class="kpi-grid">
+        <div class="kpi-card kpi-attend">
+          <div class="kpi-label">平均出席人數</div>
+          <div class="kpi-value" id="kpi-avg-attend">- 人/週</div>
+          <div class="kpi-sub" id="kpi-avg-attend-sub">統計載入中...</div>
+        </div>
+        <div class="kpi-card kpi-gospel">
+          <div class="kpi-label">平均福音朋友</div>
+          <div class="kpi-value" id="kpi-avg-gospel">- 人/週</div>
+          <div class="kpi-sub" id="kpi-avg-gospel-sub">統計載入中...</div>
+        </div>
+        <div class="kpi-card kpi-average">
+          <div class="kpi-label">活躍福音朋友</div>
+          <div class="kpi-value" id="kpi-active-gospel">- 人</div>
+          <div class="kpi-sub" id="kpi-active-gospel-sub">高於朋友平均出席次數</div>
+        </div>
+      </div>
+
+      <!-- 3. 趨勢圖表卡片（內部整合圖表與底部的指標切換開關） -->
+      <div class="stats-card">
+        <div class="stats-card-header">
+          <div class="stats-card-title">
+            <span>📈</span>
+            <span id="stats-chart-title">出席與參與趨勢曲線 <span style="font-size:0.82rem; font-weight:normal; color:var(--gray-500);">(不算服事者/家長)</span></span>
+          </div>
+        </div>
+        <div class="chart-wrapper">
+          <canvas id="stats-trend-canvas"></canvas>
+        </div>
+
+        <!-- 整合在圖表區塊底部的控制列（左側指標按鈕、右下角排除暫停週） -->
+        <div class="chart-footer-bar">
+          <div class="metrics-bar chart-metrics">
+            <span class="metrics-bar-label">圖表指標：</span>
+            <button type="button" class="metric-chip active attend" id="chip-metric-attend" onclick="toggleStatsMetric('attend')">
+              <span>● 出席</span>
+            </button>
+            <button type="button" class="metric-chip active gospel" id="chip-metric-gospel" onclick="toggleStatsMetric('gospel')">
+              <span>● 朋友</span>
+            </button>
+            <button type="button" class="metric-chip pray" id="chip-metric-pray" onclick="toggleStatsMetric('pray')">
+              <span>＋ 禱告</span>
+            </button>
+            <button type="button" class="metric-chip outreach" id="chip-metric-outreach" onclick="toggleStatsMetric('outreach')">
+              <span>＋ 出訪</span>
+            </button>
+          </div>
+          <div id="stats-exclude-suspended-wrap" class="exclude-suspended-wrap" style="display: none;">
+            <label class="exclude-suspended-label" title="計算平均與走勢時扣除該校設定之暫停週次">
+              <input type="checkbox" id="stats-exclude-suspended" onchange="toggleExcludeSuspendedWeeks()" />
+              <span>排除暫停週</span>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <!-- 4. 時間軸快速平移工具列 -->
+      <div class="stats-timeline-nav">
+        <span id="stats-window-range-label" class="stats-window-range-label">
+          載入中...
+        </span>
+        <div class="stats-nav-btn-group">
+          <button type="button" class="btn btn-outline btn-sm" onclick="shiftStatsWindow(-5)" title="往前推移 5 週">
+            ◀ 往前 5 週
+          </button>
+          <button type="button" class="btn btn-outline btn-sm" onclick="shiftStatsWindow(5)" title="往後推移 5 週">
+            往後 5 週 ▶
+          </button>
+          <button type="button" class="btn btn-outline btn-sm" style="display:inline-flex; align-items:center; gap:3px;" onclick="resetStatsWindowToLatest()" title="回到最新一週">
+            <span>最新</span><span style="font-size:0.75rem; font-weight:bold; letter-spacing:-1.5px;">▶▶</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- 5. 各校數據明細表 -->
+      <div class="stats-card">
+        <div class="stats-card-header">
+          <div class="stats-card-title">
+            <span>🏫</span>
+            <span>各小排數據對比明細</span>
+          </div>
+          <span style="font-size:0.75rem; color:var(--gray-500);">點擊可查看個別小排</span>
+        </div>
+        <div class="stats-table-wrapper">
+          <table class="stats-table">
+            <thead>
+              <tr>
+                <th class="sortable" onclick="handleStatsTableSort('name')">校園排/社區排<span class="sort-indicator" id="sort-ind-name"></span></th>
+                <th class="sortable" style="text-align:right;" onclick="handleStatsTableSort('latestAttend')">最新週<span class="sort-indicator" id="sort-ind-latestAttend"></span></th>
+                <th class="sortable active-sort" style="text-align:right;" onclick="handleStatsTableSort('avgAttend')">區間平均<span class="sort-indicator" id="sort-ind-avgAttend">▼</span></th>
+                <th class="sortable" style="text-align:right;" onclick="handleStatsTableSort('gospelTotal')">朋友累計<span class="sort-indicator" id="sort-ind-gospelTotal"></span></th>
+                <th class="sortable" style="text-align:center;" onclick="handleStatsTableSort('trend')">走勢<span class="sort-indicator" id="sort-ind-trend"></span></th>
+              </tr>
+            </thead>
+            <tbody id="stats-campus-tbody">
+              <!-- 動態填入 -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 頁面 2：點名頁面 ===== -->
+
+  <div id="page-attendance">
+
+    <div class="attendance-header">
+
+      <div class="attendance-header-top">
+
+        <button class="back-btn" onclick="goHome()">←</button>
+
+        <span class="campus-name" id="current-campus-name"></span>
+
+        <span class="attendance-count" id="attendance-count">出席0 / 禱告0 / 福音0</span>
+
+        <button class="refresh-btn" onclick="loadCampusDataFull()" title="重新載入資料">🔄</button>
+      </div>
+
+      <div class="week-selector">
+
+        <button class="week-btn" onclick="changeWeek(-1)">◀</button>
+
+        <span class="week-label" id="week-label"></span>
+
+        <button class="week-btn" onclick="changeWeek(1)">▶</button>
+      </div>
+    </div>
+
+    <!-- 小排暫停切換按鈕列（置中於成員卡片上方） -->
+    <div class="suspend-bar" id="suspend-bar">
+      <button type="button" class="btn-suspend" id="btn-suspend" onclick="handleToggleSuspendClick()">
+        ⏸️ 本週小排暫停
+      </button>
+    </div>
+
+    <div class="member-grid" id="member-list">
+
+      <!-- 動態填充 -->
+    </div>
+
+    <!-- 篩選列（左下） -->
+
+    <div class="filter-bar" id="filter-bar">
+
+      <div class="filter-chips" id="filter-chips">
+
+        <button class="filter-chip selected" data-role="全部"   onclick="setRoleFilter('全部',   this)">全部</button>
+
+        <button class="filter-chip"          data-role="弟兄"   onclick="setRoleFilter('弟兄',   this)">弟兄</button>
+
+        <button class="filter-chip"          data-role="姊妹"   onclick="setRoleFilter('姊妹',   this)">姊妹</button>
+
+        <button class="filter-chip"          data-role="男界朋友" onclick="setRoleFilter('男界朋友', this)">男界朋友</button>
+
+        <button class="filter-chip"          data-role="女界朋友" onclick="setRoleFilter('女界朋友', this)">女界朋友</button>
+
+        <button class="filter-chip"          data-role="服事者/家長" onclick="setRoleFilter('服事者/家長', this)">服事者/家長</button>
+      </div>
+
+      <button class="filter-toggle" id="filter-toggle-btn" onclick="toggleFilterPanel()">🔍 篩選</button>
+      <div class="filter-search-wrap" id="filter-search-wrap" style="display:none;" onclick="handleFilterSearchClick()">
+        <span class="filter-search-icon">🔍</span>
+        <input type="text" class="filter-search-input" id="filter-search-input" placeholder="輸入姓名" autocomplete="off" enterkeyhint="done"
+               oninput="handleFilterSearchInput(this.value)"
+               onkeydown="if((event.key==='Enter'||event.key==='Escape')&&!event.isComposing){this.blur();closeFilterPanel();}">
+        <button type="button" class="filter-search-clear" id="filter-search-clear" style="display:none;" onclick="clearFilterSearch(event)" title="清除搜尋">✕</button>
+      </div>
+    </div>
+
+    <!-- 底部中央 FAB（套用預設） -->
+
+    <button class="fab-apply-defaults" id="btn-apply-defaults" onclick="handleApplyDefaultsClick()" title="一鍵套用預設參與名單">
+
+      ⚡ 套用預設
+
+    </button>
+
+    <!-- 底部中央提示標籤（編輯模式下顯示） -->
+
+    <div class="fab-edit-hint" id="fab-edit-hint" style="display:none;">
+
+      點擊圖示可設定預設參與
+    </div>
+
+    <!-- 右下 FAB 區（說明 + 編輯 + 新增） -->
+
+    <div class="fab-group" id="fab-group">
+
+      <!-- 說明面板浮出框 -->
+
+      <div class="help-popup" id="help-popup">
+
+        <div class="help-header">
+
+          <span class="help-title" id="help-title">💡 點名與功能說明</span>
+
+          <button type="button" class="help-close-btn" onclick="toggleHelpPanel()">✕</button>
+        </div>
+
+        <!-- 點名模式說明 -->
+
+        <div id="help-mode-attendance">
+
+          <div class="help-section">
+
+            <div class="help-section-title">【點名項目】</div>
+
+            <div class="help-row">
+
+              <span class="help-tag attend">出席</span>
+
+              <div class="help-desc">實體或線上出席小排聚會</div>
+            </div>
+
+            <div class="help-row">
+
+              <span class="help-tag pray">禱告</span>
+
+              <div class="help-desc">參與同心合意的守望禱告</div>
+            </div>
+
+            <div class="help-row">
+
+              <span class="help-tag gospel">出訪</span>
+
+              <div class="help-desc">參與接觸人、出訪或福音行動</div>
+            </div>
+          </div>
+
+          <div class="help-section" style="margin-top:8px;">
+
+            <div class="help-section-title">【功能說明】</div>
+
+            <div class="help-row">
+
+              <div class="help-icon-box">🔍</div>
+
+              <div class="help-desc"><strong>篩選 / 搜尋</strong>：依身分或輸入姓名快速過濾名單。</div>
+            </div>
+
+            <div class="help-row">
+
+              <div class="help-icon-box">⚡</div>
+
+              <div class="help-desc"><strong>套用預設</strong>：一鍵帶入全體成員的預設參與項目。</div>
+            </div>
+
+            <div class="help-row">
+
+              <div class="help-icon-box">✏️</div>
+
+              <div class="help-desc"><strong>編輯人員</strong>：進入編輯模式以管理成員及預設參與。</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 編輯模式說明 -->
+
+        <div id="help-mode-edit" style="display:none;">
+
+          <div class="help-section">
+
+            <div class="help-section-title">【設定預設參與】</div>
+
+            <div class="help-row">
+
+              <div class="help-desc" style="line-height:1.5;">直接點擊成員卡片下方的 <span class="help-mini-icon attend">出席</span><span class="help-mini-icon pray">禱告</span><span class="help-mini-icon gospel">出訪</span> 按鈕，即可設定每位成員每週預設的參與項目（亮起表示啟用）。</div>
+            </div>
+          </div>
+
+          <div class="help-section" style="margin-top:8px;">
+
+            <div class="help-section-title">【人員資料管理】</div>
+
+            <div class="help-row">
+              <div class="help-icon-box"><span class="help-edit-badge-icon">✏️</span></div>
+              <div class="help-desc"><strong>修改資料</strong>：點擊卡片左上角藍色鉛筆，可修改姓名與身分。</div>
+            </div>
+
+            <div class="help-row">
+              <div class="help-icon-box"><span class="help-delete-icon">✕</span></div>
+              <div class="help-desc"><strong>刪除人位</strong>：點擊卡片右上角紅色 <span class="help-delete-icon" style="width:16px;height:16px;font-size:0.6rem;margin:0 2px;vertical-align:middle;">✕</span> 可移除該成員。</div>
+            </div>
+
+            <div class="help-row">
+              <div class="help-icon-box">➕</div>
+              <div class="help-desc"><strong>新增人位</strong>：點擊右下角綠色按鈕可新增成員。</div>
+            </div>
+
+            <div class="help-row">
+              <div class="help-icon-box">✅</div>
+              <div class="help-desc"><strong>完成編輯</strong>：所有編輯即時自動儲存，點擊勾選退出編輯模式。</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <button class="fab-add" id="fab-add-member" onclick="openModal('modal-add-member')">➕ 新增人位</button>
+
+      <div class="fab-row">
+        <button class="fab-help" id="btn-help" onclick="toggleHelpPanel()" title="使用說明">❓</button>
+        <button class="fab-edit" id="btn-edit-members" onclick="toggleMemberEditMode()" title="編輯人員">✏️</button>
+      </div>
+    </div>
+  </div>
+  <script>
+    var SERVER_PRELOADED_DATA = <?!= JSON.stringify(initialData || null) ?>;
+
+    /* @INJECT_SCRIPTS */
+  </script>
+</body>
+</html>

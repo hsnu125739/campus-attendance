@@ -1,3 +1,5 @@
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
 class AttendanceStore {
 constructor(options = {}) {
 this.apiClient = options.apiClient || {};
@@ -5,7 +7,7 @@ this.onSyncStatusChange = options.onSyncStatusChange || (() => {});
 this.onToast = options.onToast || (() => {});
 this.debounceMs = options.debounceMs ?? 400;
 this.maxRetries = options.maxRetries ?? 3;
-this.attendanceByCampus = {}; // { [campusId]: [{name, week, type, role}] }
+this.attendanceByCampus = {};
 this.minLoadedWeek = '';
 this.currentCampusId = null;
 this.currentWeekStr = '';
@@ -304,7 +306,21 @@ await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt - 1)));
 }
 }
 }
+function sortMemberList(list) {
+if (!Array.isArray(list)) return list;
+return list.sort((a, b) => {
+const countA = Number(a ? a.count : 0) || 0;
+const countB = Number(b ? b.count : 0) || 0;
+if (countB !== countA) return countB - countA;
+const nameA = (a && a.name) ? String(a.name) : '';
+const nameB = (b && b.name) ? String(b.name) : '';
+return nameA.localeCompare(nameB);
+});
+}
 class MemberStore {
+static sortMembers(list) {
+return sortMemberList(list);
+}
 constructor(options = {}) {
 this.apiClient = options.apiClient || {};
 this.onSyncStatusChange = options.onSyncStatusChange || (() => {});
@@ -313,7 +329,7 @@ this.onSuccess = options.onSuccess || (() => {});
 this.onRollback = options.onRollback || (() => {});
 this.getCurrentCampusId = options.getCurrentCampusId || (() => null);
 this.debounceMs = options.debounceMs ?? 400;
-this.queue = []; // Array<{ campusId, change, rollbackFn }>
+this.queue = [];
 this.isInFlight = false;
 this.timer = null;
 }
@@ -341,7 +357,7 @@ const merged = serverMembers.map(m => ({
 ...m,
 defaults: Array.isArray(m.defaults) ? [...m.defaults] : []
 }));
-if (!pendingQueue || pendingQueue.length === 0) return merged;
+let hasAddedOrRenamed = false;
 for (const item of pendingQueue) {
 if (campusId && item.campusId && item.campusId !== campusId) continue;
 const change = item.change;
@@ -350,6 +366,9 @@ if (change.type === 'modify') {
 const targetName = change.oldName || change.name;
 const target = merged.find(m => m.name === targetName || (change.oldName && m.name === change.oldName));
 if (target) {
+if (change.name && change.name !== target.name) {
+hasAddedOrRenamed = true;
+}
 target.name = change.name;
 target.role = change.role;
 target.stage = change.stage;
@@ -366,11 +385,15 @@ stage: change.stage,
 defaults: Array.isArray(change.defaults) ? [...change.defaults] : [],
 otherGroupId: change.otherGroupId || ''
 });
+hasAddedOrRenamed = true;
 }
 } else if (change.type === 'delete') {
 const idx = merged.findIndex(m => m.name === change.name || (change.oldName && m.name === change.oldName));
 if (idx !== -1) merged.splice(idx, 1);
 }
+}
+if (hasAddedOrRenamed) {
+sortMemberList(merged);
 }
 return merged;
 }
@@ -503,7 +526,7 @@ return this.flushMemberSync();
 }
 }
 if (typeof module !== 'undefined' && module.exports) {
-module.exports = { MemberStore };
+module.exports = { MemberStore, sortMemberList };
 }
 class CampusStore {
 constructor(options = {}) {
@@ -747,8 +770,8 @@ const sunStr = this.formatDate(sun);
 const shortLabel = `${sun.getMonth() + 1}/${sun.getDate()}`;
 const fullLabel = `${mon.getFullYear()}/${mon.getMonth() + 1}/${mon.getDate()} ~ ${sun.getMonth() + 1}/${sun.getDate()}`;
 weeks.push({
-weekStr: monStr, // 週一字串（對齊後端點名原始資料的週次記錄）
-sunStr: sunStr,   // 週日字串
+weekStr: monStr,
+sunStr: sunStr,
 shortLabel: shortLabel,
 label: fullLabel,
 monday: mon,
@@ -769,8 +792,8 @@ targetCampusId = 'ALL',
 excludeSuspended = false
 } = {}) {
 const weeks = Timeline.buildWeekList(startDate, endDate);
-const attMap = {};    // key: campusId|normWeek|type -> Set<name>
-const gospelMap = {}; // key: campusId|normWeek -> Set<gospelName>
+const attMap = {};
+const gospelMap = {};
 for (const [cid, recList] of Object.entries(attendanceByCampus || {})) {
 if (!Array.isArray(recList)) continue;
 for (const r of recList) {
@@ -844,7 +867,7 @@ prevAttendCount = weekAttend;
 });
 const avgAttend = effectiveWeeks.length > 0 ? (totalAttendSum / effectiveWeeks.length) : 0;
 const avgGospel = effectiveWeeks.length > 0 ? (totalGospelSum / effectiveWeeks.length) : 0;
-const gospelFriendAttendanceCounts = {}; // key: campusId|name -> 出席次數
+const gospelFriendAttendanceCounts = {};
 effectiveWeeks.forEach(w => {
 for (const c of targetCampuses) {
 const gSet = gospelMap[c.id + '|' + w.weekStr];
@@ -954,28 +977,68 @@ formattedThreshold: threshold.toFixed(1)
 },
 campusRankings
 };
+},
+sortRankings(rankings, column = 'avgAttend', direction = 'desc') {
+if (!Array.isArray(rankings)) return [];
+const list = [...rankings];
+const mult = (direction === 'asc') ? 1 : -1;
+const getTrendScore = (item) => {
+if (!item) return 0;
+const status = item.trendStatus || '';
+if (status === 'THIS_WEEK_SUSPENDED' || status === '本週暫停' || status === '本周暫停') {
+return -2000;
+}
+if (status === 'PREV_WEEK_SUSPENDED' || status === '上週暫停') {
+return -1000;
+}
+return Number(item.diff) || 0;
+};
+return list.sort((a, b) => {
+let diff = 0;
+if (column === 'name') {
+diff = (a.name || '').localeCompare(b.name || '', 'zh-Hant');
+} else if (column === 'latestAttend') {
+diff = (Number(a.latestAttend) || 0) - (Number(b.latestAttend) || 0);
+} else if (column === 'gospelTotal') {
+diff = (Number(a.gospelTotal) || 0) - (Number(b.gospelTotal) || 0);
+} else if (column === 'trend') {
+diff = getTrendScore(a) - getTrendScore(b);
+} else {
+diff = (Number(a.avgAttend) || 0) - (Number(b.avgAttend) || 0);
+}
+if (diff !== 0) return mult * diff;
+let secDiff = 0;
+if (column !== 'avgAttend') {
+secDiff = (Number(a.avgAttend) || 0) - (Number(b.avgAttend) || 0);
+} else {
+secDiff = (Number(a.latestAttend) || 0) - (Number(b.latestAttend) || 0);
+}
+if (secDiff !== 0) return mult * secDiff;
+return (a.name || '').localeCompare(b.name || '', 'zh-Hant');
+});
 }
 };
 if (typeof SERVER_PRELOADED_DATA === 'undefined') {
 var SERVER_PRELOADED_DATA = null;
 }
 const state = {
-campuses: [],           // [{id, name, category, sort}]
-archivedCampuses: [],   // [{id, name, category, sort, isArchived}]
-campusesSnapshot: null, // 校園編輯模式快照 (JSON string)
-membersByCampus: {},    // { [campusId]: [{name, count, role, defaults: [...]}, ...] } 全校人員快取
-currentCampusId: null,  // 當前選中的校園 ID（用於後端呼叫）
-currentCampus: null,    // 當前選中的校園名稱（用於顯示）
-members: [],            // 當前選中校園的人員名單
-membersSnapshot: null,  // 人員編輯模式快照 (JSON string)
-nameChanges: [],        // 編輯模式中的改名歷程 [{oldName, newName}]
-weekOffset: 0,          // 0=本週, -1=上週, 1=下週
-campusEditMode: false,  // 校園編輯模式
-memberEditMode: false,  // 人員編輯模式
-roleFilter: '全部',     // 身分篩選（'全部' = 不篩選）
-filterPanelOpen: false, // 篩選面板開關狀態
-helpPanelOpen: false,   // 說明面板開關狀態
-confirmCallback: null   // 確認對話框的回調函式
+campuses: [],
+archivedCampuses: [],
+campusesSnapshot: null,
+membersByCampus: {},
+currentCampusId: null,
+currentCampus: null,
+members: [],
+membersSnapshot: null,
+nameChanges: [],
+weekOffset: 0,
+campusEditMode: false,
+memberEditMode: false,
+roleFilter: '全部',
+searchQuery: '',
+filterPanelOpen: false,
+helpPanelOpen: false,
+confirmCallback: null
 };
 const CampusDomain = {
 COMMUNITY_CATEGORY: '社區排',
@@ -1151,8 +1214,8 @@ else el.value = '';
 }
 function getWeekMonday(offset) {
 const now = new Date();
-const day = now.getDay(); // 0=Sun, 1=Mon, ...
-const diff = day === 0 ? -6 : 1 - day; // 調整到本週一
+const day = now.getDay();
+const diff = day === 0 ? -6 : 1 - day;
 const monday = new Date(now);
 monday.setDate(now.getDate() + diff + (offset * 7));
 monday.setHours(0, 0, 0, 0);
@@ -1417,6 +1480,9 @@ if (!data) return;
 state.campuses = data.campuses || [];
 state.archivedCampuses = data.archivedCampuses || [];
 state.membersByCampus = data.membersByCampus || {};
+if (typeof sortMemberList === 'function') {
+Object.values(state.membersByCampus).forEach(list => sortMemberList(list));
+}
 attendanceStore.loadInitialData(data.attendanceByCampus || {}, data.minLoadedWeek || '');
 renderCampuses();
 }
@@ -1830,6 +1896,9 @@ state.memberEditMode = false;
 updateEditMemberBtn();
 resetFilter();
 state.members = state.membersByCampus[campusId] || [];
+if (typeof sortMemberList === 'function') {
+sortMemberList(state.members);
+}
 const currentCampus = state.campuses.find(c => c.id === campusId) ||
 (state.archivedCampuses && state.archivedCampuses.find(c => c.id === campusId));
 if (currentCampus && CampusDomain.isSchool(currentCampus)) {
@@ -1851,18 +1920,23 @@ updateAttendanceCount();
 }
 const statsState = {
 currentTab: 'home',
-rangeMode: 'W10',        // 'W10' | 'W20' | 'SEMESTER_CURRENT' | 'SEMESTER_SPRING' | 'SEMESTER_AUTUMN' | 'ALL' | 'CUSTOM'
-startDate: '',           // 'YYYY-MM-DD' 當前生效的起始週日
-endDate: '',             // 'YYYY-MM-DD' 當前生效的結束週日
+rangeMode: 'W10',
+startDate: '',
+endDate: '',
 selectedCampusId: 'ALL',
-excludeSuspended: false, // 排除暫停週開關（預設未勾選，僅限各校模式）
+excludeSuspended: false,
 activeMetrics: {
 attend: true,
 gospel: true,
 pray: false,
 outreach: false
 },
-chartInstance: null
+chartInstance: null,
+tableSort: {
+column: 'avgAttend',
+direction: 'desc'
+},
+lastReport: null
 };
 function getMonday(date) {
 return Timeline.getMonday(date);
@@ -2193,9 +2267,16 @@ weight: '600'
 }
 }
 function renderStatsCampusTable(report) {
+const targetReport = report || statsState.lastReport;
+if (!targetReport || !targetReport.campusRankings) return;
 const tbody = document.getElementById('stats-campus-tbody');
 if (!tbody) return;
-tbody.innerHTML = report.campusRankings.map(r => {
+const sortedRankings = StatsAggregator.sortRankings(
+targetReport.campusRankings,
+statsState.tableSort.column,
+statsState.tableSort.direction
+);
+tbody.innerHTML = sortedRankings.map(r => {
 let trendBadge = '<span class="kpi-trend-flat">― 持平</span>';
 if (r.trendStatus === 'THIS_WEEK_SUSPENDED') {
 trendBadge = '<span class="kpi-trend-suspended">本週暫停</span>';
@@ -2223,6 +2304,33 @@ ${r.category ? `<span class="category-badge ${catClass}">${r.category}</span>` :
 `;
 }).join('');
 }
+function handleStatsTableSort(col) {
+if (statsState.tableSort.column === col) {
+statsState.tableSort.direction = (statsState.tableSort.direction === 'desc') ? 'asc' : 'desc';
+} else {
+statsState.tableSort.column = col;
+statsState.tableSort.direction = 'desc';
+}
+updateStatsTableSortIndicators();
+renderStatsCampusTable();
+}
+function updateStatsTableSortIndicators() {
+const columns = ['name', 'latestAttend', 'avgAttend', 'gospelTotal', 'trend'];
+const arrow = (statsState.tableSort.direction === 'desc') ? '▼' : '▲';
+columns.forEach(col => {
+const indEl = document.getElementById('sort-ind-' + col);
+const thEl = indEl ? indEl.closest('th') : null;
+if (indEl) {
+if (col === statsState.tableSort.column) {
+indEl.textContent = arrow;
+if (thEl) thEl.classList.add('active-sort');
+} else {
+indEl.textContent = '';
+if (thEl) thEl.classList.remove('active-sort');
+}
+}
+});
+}
 function renderStatsPage() {
 const campusSelect = document.getElementById('stats-campus-select');
 if (campusSelect && campusSelect.options.length <= 1) {
@@ -2242,6 +2350,7 @@ endDate: statsState.endDate,
 targetCampusId: statsState.selectedCampusId,
 excludeSuspended: statsState.excludeSuspended
 });
+statsState.lastReport = report;
 const rangeLabelEl = document.getElementById('stats-window-range-label');
 if (rangeLabelEl) {
 if (report.window.weeks.length > 0) {
@@ -2290,6 +2399,7 @@ const gKpi = report.kpis.activeGospel;
 kpiActiveGospelSubEl.innerHTML = `出席 > ${gKpi.formattedThreshold}次<br>(${gKpi.totalFriends}位中有${gKpi.count}位達標)`;
 }
 renderStatsTrendChart(report);
+updateStatsTableSortIndicators();
 renderStatsCampusTable(report);
 }
 function getMemberPendingCount() {
@@ -2327,6 +2437,7 @@ const helpBtn = document.getElementById('btn-help');
 if (helpPopup) helpPopup.classList.remove('open');
 if (helpBtn) helpBtn.classList.remove('active');
 updateEditMemberBtn();
+resetFilter();
 if (state.campusEditMode) {
 state.campusEditMode = false;
 updateCampusFooterUI();
@@ -2356,9 +2467,12 @@ const ROLE_CLASS_MAP = {
 };
 function renderMembers() {
 const container = document.getElementById('member-list');
-const filtered = state.roleFilter === '全部'
+const q = state.searchQuery || '';
+const filtered = q !== ''
+? state.members.filter(m => (m.name || '').replace(/\s+/g, '').includes(q))
+: (state.roleFilter === '全部'
 ? state.members
-: state.members.filter(m => m.role === state.roleFilter);
+: state.members.filter(m => m.role === state.roleFilter));
 if (state.members.length === 0) {
 container.innerHTML = `
 <div class="empty-state" style="grid-column: 1/-1;">
@@ -2371,8 +2485,11 @@ if (filtered.length === 0) {
 container.innerHTML = `
 <div class="empty-state" style="grid-column: 1/-1;">
 <div class="icon">🔍</div>
-<p>目前篩選「${state.roleFilter}」無人員</p>
+<p></p>
 </div>`;
+container.querySelector('p').textContent = q !== ''
+? `找不到符合「${q}」的人員`
+: `目前篩選「${state.roleFilter}」無人員`;
 return;
 }
 const fragment = document.createDocumentFragment();
@@ -2531,6 +2648,7 @@ otherGroupId: otherGroupId,
 stage: stage || '其他'
 };
 state.members.push(newMember);
+sortMemberList(state.members);
 if (state.currentCampusId) {
 state.membersByCampus[state.currentCampusId] = state.members;
 }
@@ -2550,6 +2668,7 @@ if (idx !== -1) state.members.splice(idx, 1);
 if (state.currentCampusId) {
 state.membersByCampus[state.currentCampusId] = state.members;
 }
+if (typeof renderMembers === 'function') renderMembers();
 };
 scheduleMemberSync(change, rollbackFn);
 showToast(`已新增「${name}」`, 'success');
@@ -2565,10 +2684,12 @@ state.membersByCampus[state.currentCampusId] = state.members;
 renderMembers();
 const change = { type: 'delete', name: name };
 const rollbackFn = () => {
-state.members.splice(idx, 0, deletedMember);
+state.members.push(deletedMember);
+sortMemberList(state.members);
 if (state.currentCampusId) {
 state.membersByCampus[state.currentCampusId] = state.members;
 }
+if (typeof renderMembers === 'function') renderMembers();
 };
 scheduleMemberSync(change, rollbackFn);
 showToast(`已刪除「${name}」`, 'success');
@@ -2700,6 +2821,7 @@ if (stage) member.stage = stage;
 }
 if (newName !== oldName) {
 attendanceStore.renameMember(oldName, newName);
+sortMemberList(state.members);
 }
 if (state.currentCampusId) {
 state.membersByCampus[state.currentCampusId] = state.members;
@@ -2727,10 +2849,12 @@ target.otherGroupId = oldMemberSnapshot.otherGroupId;
 }
 if (newName !== oldName) {
 attendanceStore.renameMember(newName, oldName);
+sortMemberList(state.members);
 }
 if (state.currentCampusId) {
 state.membersByCampus[state.currentCampusId] = state.members;
 }
+if (typeof renderMembers === 'function') renderMembers();
 }
 };
 scheduleMemberSync(change, rollbackFn);
@@ -2897,15 +3021,87 @@ helpBtn.blur();
 }
 }
 function toggleFilterPanel() {
-state.filterPanelOpen = !state.filterPanelOpen;
-document.getElementById('filter-chips').classList.toggle('open', state.filterPanelOpen);
+state.filterPanelOpen = true;
+const chips = document.getElementById('filter-chips');
 const filterBtn = document.getElementById('filter-toggle-btn');
-if (filterBtn) {
-filterBtn.classList.toggle('panel-open', state.filterPanelOpen);
-if (!state.filterPanelOpen) filterBtn.blur();
+const searchWrap = document.getElementById('filter-search-wrap');
+if (chips) chips.classList.add('open');
+if (filterBtn) filterBtn.style.display = 'none';
+if (searchWrap) {
+searchWrap.style.display = 'flex';
+searchWrap.classList.add('panel-open');
 }
-if (state.filterPanelOpen && state.helpPanelOpen) {
+if (state.helpPanelOpen) {
 closeHelpPanel();
+}
+}
+function closeFilterPanel() {
+state.filterPanelOpen = false;
+const chips = document.getElementById('filter-chips');
+const filterBtn = document.getElementById('filter-toggle-btn');
+const searchWrap = document.getElementById('filter-search-wrap');
+const searchInput = document.getElementById('filter-search-input');
+if (chips) chips.classList.remove('open');
+if (searchWrap) searchWrap.classList.remove('panel-open');
+if (searchInput) searchInput.blur();
+if (state.searchQuery) {
+if (searchWrap) {
+searchWrap.style.display = 'flex';
+searchWrap.classList.add('active-search');
+}
+if (filterBtn) filterBtn.style.display = 'none';
+} else {
+if (searchInput) searchInput.value = '';
+if (searchWrap) {
+searchWrap.style.display = 'none';
+searchWrap.classList.remove('active-search');
+}
+if (filterBtn) {
+filterBtn.style.display = '';
+filterBtn.classList.remove('panel-open');
+filterBtn.blur();
+}
+}
+}
+function handleFilterSearchClick() {
+if (!state.filterPanelOpen) {
+toggleFilterPanel();
+}
+const searchInput = document.getElementById('filter-search-input');
+if (searchInput && document.activeElement !== searchInput) {
+searchInput.focus();
+}
+}
+function handleFilterSearchInput(rawVal) {
+const q = (rawVal || '').replace(/\s+/g, '');
+state.searchQuery = q;
+const clearBtn = document.getElementById('filter-search-clear');
+const searchWrap = document.getElementById('filter-search-wrap');
+const toggleBtn = document.getElementById('filter-toggle-btn');
+if (clearBtn) clearBtn.style.display = q ? 'inline-flex' : 'none';
+if (searchWrap) searchWrap.classList.toggle('active-search', q !== '');
+document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('selected'));
+if (q) {
+state.roleFilter = '全部';
+if (toggleBtn) {
+toggleBtn.textContent = '🔍 篩選';
+toggleBtn.classList.remove('active-filter');
+}
+} else {
+const activeChip = document.querySelector(`.filter-chip[data-role="${state.roleFilter}"]`);
+if (activeChip) activeChip.classList.add('selected');
+}
+renderMembers();
+}
+function clearFilterSearch(e) {
+if (e) e.stopPropagation();
+const searchInput = document.getElementById('filter-search-input');
+if (searchInput) searchInput.value = '';
+handleFilterSearchInput('');
+if (state.filterPanelOpen) {
+if (searchInput) searchInput.focus();
+} else {
+closeFilterPanel();
 }
 }
 function toggleHelpPanel() {
@@ -2919,18 +3115,16 @@ helpBtn.classList.toggle('active', state.helpPanelOpen);
 if (!state.helpPanelOpen) helpBtn.blur();
 }
 if (state.helpPanelOpen && state.filterPanelOpen) {
-state.filterPanelOpen = false;
-const chips = document.getElementById('filter-chips');
-if (chips) chips.classList.remove('open');
-const filterBtn = document.getElementById('filter-toggle-btn');
-if (filterBtn) {
-filterBtn.classList.remove('panel-open');
-filterBtn.blur();
-}
+closeFilterPanel();
 }
 }
 function setRoleFilter(role, chipEl) {
 state.roleFilter = role;
+state.searchQuery = '';
+const searchInput = document.getElementById('filter-search-input');
+const clearBtn = document.getElementById('filter-search-clear');
+if (searchInput) searchInput.value = '';
+if (clearBtn) clearBtn.style.display = 'none';
 document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('selected'));
 chipEl.classList.add('selected');
 const toggleBtn = document.getElementById('filter-toggle-btn');
@@ -2941,15 +3135,18 @@ toggleBtn.classList.remove('active-filter');
 toggleBtn.textContent = `🔍 ${role}`;
 toggleBtn.classList.add('active-filter');
 }
-state.filterPanelOpen = false;
-document.getElementById('filter-chips').classList.remove('open');
+closeFilterPanel();
 renderMembers();
 }
 function resetFilter() {
 state.roleFilter = '全部';
+state.searchQuery = '';
 state.filterPanelOpen = false;
 state.helpPanelOpen = false;
-document.getElementById('filter-chips').classList.remove('open');
+const searchInput = document.getElementById('filter-search-input');
+const clearBtn = document.getElementById('filter-search-clear');
+if (searchInput) searchInput.value = '';
+if (clearBtn) clearBtn.style.display = 'none';
 const helpPopup = document.getElementById('help-popup');
 const helpBtn = document.getElementById('btn-help');
 if (helpPopup) helpPopup.classList.remove('open');
@@ -2958,7 +3155,11 @@ document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('selec
 const allChip = document.querySelector('.filter-chip[data-role="全部"]');
 if (allChip) allChip.classList.add('selected');
 const toggleBtn = document.getElementById('filter-toggle-btn');
-if (toggleBtn) { toggleBtn.textContent = '🔍 篩選'; toggleBtn.classList.remove('active-filter'); }
+if (toggleBtn) {
+toggleBtn.textContent = '🔍 篩選';
+toggleBtn.classList.remove('active-filter');
+}
+closeFilterPanel();
 }
 function initMemberListDelegation() {
 const container = document.getElementById('member-list');
@@ -3000,9 +3201,7 @@ document.addEventListener('click', (e) => {
 if (state.filterPanelOpen) {
 const filterBar = document.getElementById('filter-bar');
 if (filterBar && !filterBar.contains(e.target)) {
-state.filterPanelOpen = false;
-const chips = document.getElementById('filter-chips');
-if (chips) chips.classList.remove('open');
+closeFilterPanel();
 }
 }
 if (state.helpPanelOpen) {
@@ -3070,9 +3269,10 @@ downTarget = null;
 window.addEventListener('DOMContentLoaded', () => {
 initCampusListDelegation();
 initMemberListDelegation();
-if (SERVER_PRELOADED_DATA && SERVER_PRELOADED_DATA.campuses) {
+if (typeof SERVER_PRELOADED_DATA !== 'undefined' && SERVER_PRELOADED_DATA && SERVER_PRELOADED_DATA.campuses) {
 applyLoadedData(SERVER_PRELOADED_DATA);
 } else {
 loadInitialDataFromCloud(false);
 }
 });
+</script>

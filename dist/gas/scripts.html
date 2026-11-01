@@ -1,0 +1,4398 @@
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+// ==========================================
+    // ===== AttendanceStore 前端深模組 =====
+    // ==========================================
+
+    /**
+     * 點名狀態管理與批次同步深模組 (AttendanceStore)
+     * 封裝：0ms 樂觀更新、當週 Set 索引、防抖聚合隊列、意圖保留 (保護連續點擊不被覆蓋)、
+     * 指數退避探測參數 rPrime 計算、歷史點名滑動載入與頭部拼接。
+     */
+    class AttendanceStore {
+      /**
+       * @param {Object} [options]
+       * @param {Object} [options.apiClient] API Client 物件（提供 batchUpdateAttendance, applyDefaultAttendance, getAttendanceHistory）
+       * @param {Function} [options.onSyncStatusChange] 同步狀態計數變更通知 (pendingCount) => void
+       * @param {Function} [options.onToast] 訊息提示通知 (message, type) => void
+       * @param {number} [options.debounceMs=400] 防抖延遲時間（毫秒）
+       * @param {number} [options.maxRetries=3] 網路錯誤重試次數
+       */
+      constructor(options = {}) {
+        this.apiClient = options.apiClient || {};
+        this.onSyncStatusChange = options.onSyncStatusChange || (() => {});
+        this.onToast = options.onToast || (() => {});
+        this.debounceMs = options.debounceMs ?? 400;
+        this.maxRetries = options.maxRetries ?? 3;
+
+        this.attendanceByCampus = {}; // { [campusId]: [{name, week, type, role}] }
+        this.minLoadedWeek = '';
+        this.currentCampusId = null;
+        this.currentWeekStr = '';
+        this.weekIndex = { '出席': new Set(), '禱告': new Set(), '傳福音': new Set() };
+        this.syncQueue = {};
+        this.batchSyncTimer = null;
+        this.isBatchSyncInFlight = false;
+        this.attendanceChanged = false;
+        this.isLoadingHistory = false;
+      }
+
+      /**
+       * 載入雲端初始點名資料與最小載入週次
+       * @param {Object.<string, Array>} attendanceByCampus 各校點名紀錄集合
+       * @param {string} minLoadedWeek 目前已加載的最小週次字串 (YYYY-MM-DD)
+       */
+      loadInitialData(attendanceByCampus, minLoadedWeek) {
+        this.attendanceByCampus = attendanceByCampus || {};
+        this.minLoadedWeek = minLoadedWeek || '';
+        if (this.currentCampusId && this.currentWeekStr) this._rebuildWeekIndex();
+      }
+
+      /**
+       * 設定當前檢視的校園與週次上下文，並自動重建索引
+       * @param {string} campusId 校園 ID
+       * @param {string} weekStr 週一日期字串 (YYYY-MM-DD)
+       */
+      setCurrentContext(campusId, weekStr) {
+        this.currentCampusId = campusId;
+        this.currentWeekStr = weekStr;
+        this._rebuildWeekIndex();
+      }
+
+      /**
+       * 內部重構當前週次的 O(1) 點名快速檢索 Set 索引
+       * @private
+       */
+      _rebuildWeekIndex() {
+        this.weekIndex = { '出席': new Set(), '禱告': new Set(), '傳福音': new Set() };
+        if (!this.currentCampusId || !this.currentWeekStr) return;
+        const list = this.attendanceByCampus[this.currentCampusId] || [];
+        for (let i = 0; i < list.length; i++) {
+          const r = list[i];
+          if (r.week === this.currentWeekStr && this.weekIndex[r.type]) {
+            this.weekIndex[r.type].add(r.name);
+          }
+        }
+      }
+
+      /**
+       * 檢查特定成員在當前週次中是否已勾選特定點名類型
+       * @param {string} name 成員姓名
+       * @param {string} type 點名類型 ('出席' | '禱告' | '傳福音')
+       * @returns {boolean}
+       */
+      isMarked(name, type) {
+        return Boolean(this.weekIndex[type]?.has(name));
+      }
+
+      /**
+       * 取得當前週次各項點名之統計計數
+       * @returns {{ attend: number, pray: number, gospel: number }}
+       */
+      getWeekCounts() {
+        return {
+          attend: this.weekIndex['出席']?.size || 0,
+          pray:   this.weekIndex['禱告']?.size || 0,
+          gospel: this.weekIndex['傳福音']?.size || 0
+        };
+      }
+
+      /**
+       * 計算目前等待同步至後端的點名操作筆數
+       * @returns {number}
+       */
+      getPendingCount() {
+        let count = 0;
+        for (const k in this.syncQueue) {
+          if (this.syncQueue[k].desiredState !== this.syncQueue[k].syncedState) count++;
+        }
+        return count;
+      }
+
+      /**
+       * 檢查本次會話中點名資料是否有發生實質變更
+       * @returns {boolean}
+       */
+      hasChanged() { return this.attendanceChanged; }
+
+      /**
+       * 重置變更標記
+       */
+      resetChanged() { this.attendanceChanged = false; }
+
+      /**
+       * 取得特定校園在快取中的全部點名紀錄陣列
+       * @param {string} [campusId] 校園 ID（未提供則使用當前校園）
+       * @returns {Array}
+       */
+      getCurrentCampusAttendance(campusId) {
+        const cid = campusId || this.currentCampusId;
+        if (!cid) return [];
+        return (this.attendanceByCampus[cid] ||= []);
+      }
+
+      /**
+       * 依週次排序將紀錄插入至指定校園的點名陣列中
+       * @private
+       * @param {Array} list 點名紀錄清單
+       * @param {Object} record 點名紀錄物件
+       */
+      _insertAttendanceSorted(list, record) {
+        let i = list.length;
+        while (i > 0 && list[i - 1].week > record.week) i--;
+        if (i === list.length) list.push(record);
+        else list.splice(i, 0, record);
+      }
+
+      /**
+       * 精準計算大於等於目標週次（targetWeek）之所有校園點名紀錄總筆數 (rPrime)
+       * 供後端指數退避定位探測使用
+       * @param {string} targetWeek 目標週一日期 (YYYY-MM-DD)
+       * @returns {number}
+       */
+      computeTargetWeekRPrime(targetWeek) {
+        if (this.minLoadedWeek && this.minLoadedWeek !== '0000-00-00' && this.minLoadedWeek !== '__ALL__' && targetWeek < this.minLoadedWeek) {
+          return 0;
+        }
+        let count = 0;
+        for (const cid in this.attendanceByCampus) {
+          const list = this.attendanceByCampus[cid] || [];
+          for (let i = list.length - 1; i >= 0; i--) {
+            if (list[i].week >= targetWeek) count++;
+            else break;
+          }
+        }
+        return count;
+      }
+
+      /**
+       * 點擊切換出席/禱告/傳福音狀態 (0ms 樂觀更新 + 防抖聚合隊列)
+       * @param {string} name 成員姓名
+       * @param {string} type 點名類型 ('出席' | '禱告' | '傳福音')
+       * @param {string} [role=''] 當時身分（弟兄/姊妹/男界朋友/女界朋友）
+       * @returns {{ isMarked: boolean, weekCounts: { attend: number, pray: number, gospel: number } }}
+       */
+      toggle(name, type, role = '') {
+        const campus = this.currentCampusId, weekStr = this.currentWeekStr;
+        if (!campus || !weekStr) throw new Error('未設定當前校園或週次上下文');
+
+        const key = `${campus}|${name}|${weekStr}|${type}`;
+        const list = this.getCurrentCampusAttendance(campus);
+
+        if (!this.syncQueue[key]) {
+          const currentIsOn = this.isMarked(name, type);
+          this.syncQueue[key] = {
+            campus, name, role: role || '', weekStr, type,
+            syncedState: currentIsOn, desiredState: currentIsOn
+          };
+        }
+
+        const entry = this.syncQueue[key];
+        entry.desiredState = !entry.desiredState;
+
+        if (entry.desiredState) {
+          this.weekIndex[type]?.add(name);
+          if (!list.some(r => r.name === name && r.week === weekStr && r.type === type)) {
+            this._insertAttendanceSorted(list, { name, week: weekStr, type, role: entry.role || role });
+          }
+        } else {
+          this.weekIndex[type]?.delete(name);
+          const idx = list.findIndex(r => r.name === name && r.week === weekStr && r.type === type);
+          if (idx !== -1) list.splice(idx, 1);
+        }
+
+        this.attendanceChanged = true;
+        if (entry.desiredState === entry.syncedState && !this.isBatchSyncInFlight) {
+          delete this.syncQueue[key];
+        }
+
+        this.onSyncStatusChange(this.getPendingCount());
+        this.scheduleBatchSync();
+
+        return { isMarked: entry.desiredState, weekCounts: this.getWeekCounts() };
+      }
+
+      /**
+       * 排程防抖批次同步計時器
+       * @param {boolean} [immediate=false] 是否略過防抖立即送出
+       */
+      scheduleBatchSync(immediate = false) {
+        if (this.batchSyncTimer) {
+          clearTimeout(this.batchSyncTimer);
+          this.batchSyncTimer = null;
+        }
+        if (immediate) {
+          this.flush();
+          return;
+        }
+        this.batchSyncTimer = setTimeout(() => {
+          this.batchSyncTimer = null;
+          this.flush();
+        }, this.debounceMs);
+        this.onSyncStatusChange(this.getPendingCount());
+      }
+
+      /**
+       * 立即將隊列中所有待同步的點名變更批次送至後端
+       * 支援意圖保護 (若在途請求返回前使用者已再次切換，不被舊失敗還原覆蓋)
+       * @returns {Promise<void>}
+       */
+      async flush() {
+        if (this.isBatchSyncInFlight) return;
+        if (this.batchSyncTimer) {
+          clearTimeout(this.batchSyncTimer);
+          this.batchSyncTimer = null;
+        }
+
+        const pendingKeys = Object.keys(this.syncQueue).filter(
+          k => this.syncQueue[k].desiredState !== this.syncQueue[k].syncedState
+        );
+        if (pendingKeys.length === 0) {
+          this.onSyncStatusChange(0);
+          return;
+        }
+
+        const campusId = this.syncQueue[pendingKeys[0]].campus;
+        const weekStr  = this.syncQueue[pendingKeys[0]].weekStr;
+        const marks = [], unmarks = [], batchEntries = [];
+
+        pendingKeys.forEach(k => {
+          const item = this.syncQueue[k];
+          if (item.campus !== campusId || item.weekStr !== weekStr) return;
+          batchEntries.push({ key: k, targetState: item.desiredState, item });
+          if (item.desiredState) marks.push({ name: item.name, role: item.role || '', type: item.type });
+          else unmarks.push({ name: item.name, type: item.type });
+        });
+
+        this.isBatchSyncInFlight = true;
+        this.onSyncStatusChange(this.getPendingCount());
+
+        try {
+          if (typeof this.apiClient.batchUpdateAttendance === 'function') {
+            const rPrime = this.computeTargetWeekRPrime(weekStr);
+            await this._retryCall(() => this.apiClient.batchUpdateAttendance(campusId, weekStr, marks, unmarks, rPrime));
+          }
+          batchEntries.forEach(b => {
+            b.item.syncedState = b.targetState;
+            if (b.item.desiredState === b.item.syncedState) delete this.syncQueue[b.key];
+          });
+        } catch (e) {
+          this.onToast(`儲存失敗：點名紀錄未能同步 (${e.message})`, 'error');
+          const list = this.getCurrentCampusAttendance(campusId);
+          batchEntries.forEach(b => {
+            if (b.item.desiredState !== b.targetState) return;
+            b.item.desiredState = b.item.syncedState;
+            if (b.item.syncedState) {
+              if (this.currentCampusId === campusId && this.currentWeekStr === b.item.weekStr) {
+                this.weekIndex[b.item.type]?.add(b.item.name);
+              }
+              if (!list.some(r => r.name === b.item.name && r.week === b.item.weekStr && r.type === b.item.type)) {
+                this._insertAttendanceSorted(list, { name: b.item.name, week: b.item.weekStr, type: b.item.type, role: b.item.role || '' });
+              }
+            } else {
+              if (this.currentCampusId === campusId && this.currentWeekStr === b.item.weekStr) {
+                this.weekIndex[b.item.type]?.delete(b.item.name);
+              }
+              const idx = list.findIndex(r => r.name === b.item.name && r.week === b.item.weekStr && r.type === b.item.type);
+              if (idx !== -1) list.splice(idx, 1);
+            }
+          });
+        } finally {
+          this.isBatchSyncInFlight = false;
+          this.onSyncStatusChange(this.getPendingCount());
+          if (Object.keys(this.syncQueue).some(k => this.syncQueue[k].desiredState !== this.syncQueue[k].syncedState)) {
+            this.scheduleBatchSync(true);
+          }
+        }
+      }
+
+      /**
+       * 一鍵套用預設出席名單至當前週次（覆蓋原週次紀錄並即時同步至後端）
+       * @param {Array<{ name: string, type: string, role: string }>} records 欲套用之紀錄
+       * @returns {Promise<void>}
+       */
+      async applyDefaults(records) {
+        const campusId = this.currentCampusId, weekStr = this.currentWeekStr;
+        if (!campusId || !weekStr) throw new Error('未設定當前校園或週次');
+
+        const list = this.getCurrentCampusAttendance(campusId);
+        const filteredList = list.filter(r => r.week !== weekStr);
+        this.attendanceByCampus[campusId] = filteredList;
+        this.weekIndex = { '出席': new Set(), '禱告': new Set(), '傳福音': new Set() };
+
+        (records || []).forEach(r => {
+          this.weekIndex[r.type]?.add(r.name);
+          this._insertAttendanceSorted(filteredList, { name: r.name, week: weekStr, type: r.type, role: r.role || '' });
+        });
+
+        this.attendanceChanged = true;
+        for (const k in this.syncQueue) {
+          if (this.syncQueue[k].campus === campusId && this.syncQueue[k].weekStr === weekStr) {
+            delete this.syncQueue[k];
+          }
+        }
+        this.onSyncStatusChange(this.getPendingCount());
+
+        if (typeof this.apiClient.applyDefaultAttendance === 'function') {
+          const rPrime = this.computeTargetWeekRPrime(weekStr);
+          const result = await this.apiClient.applyDefaultAttendance(campusId, weekStr, records, rPrime);
+          if (result && result.success === false) throw new Error(result.error || '伺服器套用失敗');
+        }
+      }
+
+      /**
+       * 成員改名時連動更新記憶體快取、當週索引與待同步隊列中的姓名
+       * @param {string} oldName 舊姓名
+       * @param {string} newName 新姓名
+       */
+      renameMember(oldName, newName) {
+        if (!oldName || !newName || oldName === newName) return;
+        const list = this.getCurrentCampusAttendance(this.currentCampusId);
+        list.forEach(r => { if (r.name === oldName) r.name = newName; });
+        for (const t in this.weekIndex) {
+          if (this.weekIndex[t].has(oldName)) {
+            this.weekIndex[t].delete(oldName);
+            this.weekIndex[t].add(newName);
+          }
+        }
+        for (const k of Object.keys(this.syncQueue)) {
+          const item = this.syncQueue[k];
+          if (item.campus === this.currentCampusId && item.name === oldName) {
+            item.name = newName;
+            const newKey = k.replace(`|${oldName}|`, `|${newName}|`);
+            if (newKey !== k) {
+              this.syncQueue[newKey] = item;
+              delete this.syncQueue[k];
+            }
+          }
+        }
+      }
+
+      /**
+       * 成員刪除時同步自當週索引移除
+       * @param {string} name 成員姓名
+       */
+      removeMember(name) {
+        for (const t in this.weekIndex) this.weekIndex[t].delete(name);
+      }
+
+      /**
+       * 切換當前週次（若超出已快取週次範圍，自動非同步預載歷史點名紀錄）
+       * @param {string} targetWeekStr 目標週一日期 (YYYY-MM-DD)
+       * @returns {Promise<void>}
+       */
+      async setWeek(targetWeekStr) {
+        if (this.minLoadedWeek && this.minLoadedWeek !== '0000-00-00' && this.minLoadedWeek !== '__ALL__' && targetWeekStr < this.minLoadedWeek) {
+          const targetDate = new Date(targetWeekStr + 'T00:00:00');
+          targetDate.setDate(targetDate.getDate() - 12 * 7);
+          const y = targetDate.getFullYear();
+          const m = String(targetDate.getMonth() + 1).padStart(2, '0');
+          const d = String(targetDate.getDate()).padStart(2, '0');
+          await this.ensureAttendanceRange(`${y}-${m}-${d}`);
+        }
+        this.currentWeekStr = targetWeekStr;
+        this._rebuildWeekIndex();
+      }
+
+      /**
+       * 確保指定起始週（targetStartWeek）以上的點名資料已存在快取中
+       * @param {string} targetStartWeek 目標起始週一 (YYYY-MM-DD)
+       * @returns {Promise<boolean>}
+       */
+      async ensureAttendanceRange(targetStartWeek) {
+        if (this.minLoadedWeek === '0000-00-00' || this.minLoadedWeek === '__ALL__') return true;
+        if (targetStartWeek && this.minLoadedWeek && targetStartWeek >= this.minLoadedWeek) return true;
+        if (this.isLoadingHistory) return false;
+        this.isLoadingHistory = true;
+
+        try {
+          const curDate = new Date(this.minLoadedWeek + 'T00:00:00');
+          curDate.setDate(curDate.getDate() - 7);
+          const y = curDate.getFullYear();
+          const m = String(curDate.getMonth() + 1).padStart(2, '0');
+          const d = String(curDate.getDate()).padStart(2, '0');
+          const endWeek = `${y}-${m}-${d}`;
+
+          if (typeof this.apiClient.getAttendanceHistory === 'function') {
+            const result = await this.apiClient.getAttendanceHistory(targetStartWeek || '', endWeek);
+            if (result && result.success && result.data) {
+              const newMin = (result.data.hasMore === false || !targetStartWeek) ? '0000-00-00' : targetStartWeek;
+              this.mergeAttendanceHistory(result.data.attendanceByCampus, newMin);
+              return true;
+            }
+          }
+          return false;
+        } catch (e) {
+          this.onToast('載入歷史紀錄失敗：' + e.message, 'error');
+          return false;
+        } finally {
+          this.isLoadingHistory = false;
+        }
+      }
+
+      /**
+       * 將更早的歷史點名紀錄頭部拼接 (unshift/concat) 至快取中
+       * @param {Object.<string, Array>} historyByCampus 各校歷史點名紀錄
+       * @param {string} [newMinLoadedWeek] 新的最小已載入週次
+       */
+      mergeAttendanceHistory(historyByCampus, newMinLoadedWeek) {
+        if (!historyByCampus) return;
+        for (const cid in historyByCampus) {
+          const hist = historyByCampus[cid] || [];
+          if (hist.length === 0) continue;
+          const current = this.attendanceByCampus[cid] || [];
+          this.attendanceByCampus[cid] = hist.concat(current);
+        }
+        if (newMinLoadedWeek) this.minLoadedWeek = newMinLoadedWeek;
+        this._rebuildWeekIndex();
+      }
+
+      /**
+       * 內部重試輔助函式（支援指數退避重試）
+       * @private
+       * @param {Function} fn 非同步操作函式
+       * @returns {Promise<*>}
+       */
+      async _retryCall(fn) {
+        for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+          try {
+            const result = await fn();
+            if (result && result.success === false) throw new Error(result.error || '後端回傳失敗');
+            return result;
+          } catch (e) {
+            if (attempt === this.maxRetries) throw e;
+            await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt - 1)));
+          }
+        }
+      }
+    }
+
+// ==========================================
+// ===== MemberStore 前端深模組 =====
+// ==========================================
+
+/**
+ * 人員清單標準排序函式（與後端 SpreadsheetRepository 規範 100% 一致）
+ * 規則：出席次數降序 (count 較高者在先)；若次數相同則依姓名字串筆畫/語系升序 (a.name.localeCompare(b.name))
+ * @param {Array} list 人員陣列
+ * @returns {Array} 排序後的人員陣列原址參照
+ */
+function sortMemberList(list) {
+  if (!Array.isArray(list)) return list;
+  return list.sort((a, b) => {
+    const countA = Number(a ? a.count : 0) || 0;
+    const countB = Number(b ? b.count : 0) || 0;
+    if (countB !== countA) return countB - countA;
+    const nameA = (a && a.name) ? String(a.name) : '';
+    const nameB = (b && b.name) ? String(b.name) : '';
+    return nameA.localeCompare(nameB);
+  });
+}
+
+/**
+ * 成員管理 0ms 樂觀自動同步與回退管線深模組
+ * 封裝隊列、防抖計時器、在途請求鎖、記憶體快照合併、改名聚合與失敗回退。
+ */
+class MemberStore {
+  static sortMembers(list) {
+    return sortMemberList(list);
+  }
+  /**
+   * @param {Object} [options]
+   * @param {Object} [options.apiClient] API Client 物件，需提供 applyMemberChanges(campusId, { changes })
+   * @param {Function} [options.onSyncStatusChange] 同步狀態計數變更通知 (pendingCount) => void
+   * @param {Function} [options.onToast] 提示通知 (msg, type) => void
+   * @param {Function} [options.onSuccess] 儲存成功回調 (campusId, mergedMembers, affectedMembers, warnings) => void
+   * @param {Function} [options.onRollback] 失敗回退回調 (campusId, batch, error) => void
+   * @param {Function} [options.getCurrentCampusId] 取得當前校園 ID 的回調 () => string
+   * @param {number} [options.debounceMs=400] 防抖時間（毫秒）
+   */
+  constructor(options = {}) {
+    this.apiClient = options.apiClient || {};
+    this.onSyncStatusChange = options.onSyncStatusChange || (() => {});
+    this.onToast = options.onToast || (() => {});
+    this.onSuccess = options.onSuccess || (() => {});
+    this.onRollback = options.onRollback || (() => {});
+    this.getCurrentCampusId = options.getCurrentCampusId || (() => null);
+    this.debounceMs = options.debounceMs ?? 400;
+
+    this.queue = []; // Array<{ campusId, change, rollbackFn }>
+    this.isInFlight = false;
+    this.timer = null;
+  }
+
+  /**
+   * 取得目前正在排程或傳輸中的變更筆數
+   * @returns {number}
+   */
+  getPendingCount() {
+    return this.queue.length + (this.isInFlight ? 1 : 0);
+  }
+
+  /**
+   * 取得內部隊列副本（測試與偵錯專用）
+   * @returns {Array}
+   */
+  getQueue() {
+    return this.queue;
+  }
+
+  /**
+   * 設定內部隊列（測試與偵錯專用）
+   * @param {Array} q
+   */
+  setQueue(q) {
+    this.queue = Array.isArray(q) ? q : [];
+  }
+
+  /**
+   * 將後端回傳的最新人員快照與前端尚在隊列中的變更進行記憶體內合併
+   * 防止在 RPC 請求在途 (in-flight) 期間，使用者連續修改其他成員時，
+   * 因舊快照返回而導致「1秒短暫回滾」閃爍現象。
+   * 
+   * @param {Array} serverMembers 伺服器回傳之人員名單
+   * @param {Array|string} [pendingQueueOrCampusId] 待處理隊列（若未傳入則使用內部 queue）或 campusId
+   * @param {string} [optionalCampusId] 校園 ID（若第 2 參數為 pendingQueue 時使用）
+   * @returns {Array} 合併後的人員名單副本
+   */
+  mergeServerMembersWithPendingQueue(serverMembers, pendingQueueOrCampusId, optionalCampusId) {
+    if (!Array.isArray(serverMembers)) return [];
+
+    let pendingQueue;
+    let campusId;
+
+    if (Array.isArray(pendingQueueOrCampusId)) {
+      pendingQueue = pendingQueueOrCampusId;
+      campusId = optionalCampusId || this.getCurrentCampusId();
+    } else {
+      pendingQueue = this.queue;
+      campusId = pendingQueueOrCampusId || this.getCurrentCampusId();
+    }
+
+    const merged = serverMembers.map(m => ({
+      ...m,
+      defaults: Array.isArray(m.defaults) ? [...m.defaults] : []
+    }));
+
+    let hasAddedOrRenamed = false;
+    for (const item of pendingQueue) {
+      if (campusId && item.campusId && item.campusId !== campusId) continue;
+      const change = item.change;
+      if (!change) continue;
+
+      if (change.type === 'modify') {
+        const targetName = change.oldName || change.name;
+        const target = merged.find(m => m.name === targetName || (change.oldName && m.name === change.oldName));
+        if (target) {
+          if (change.name && change.name !== target.name) {
+            hasAddedOrRenamed = true;
+          }
+          target.name = change.name;
+          target.role = change.role;
+          target.stage = change.stage;
+          target.defaults = Array.isArray(change.defaults) ? [...change.defaults] : [];
+          if (change.otherGroupId !== undefined) target.otherGroupId = change.otherGroupId;
+        }
+      } else if (change.type === 'add') {
+        if (!merged.some(m => m.name === change.name)) {
+          merged.push({
+            name: change.name,
+            count: 0,
+            role: change.role,
+            stage: change.stage,
+            defaults: Array.isArray(change.defaults) ? [...change.defaults] : [],
+            otherGroupId: change.otherGroupId || ''
+          });
+          hasAddedOrRenamed = true;
+        }
+      } else if (change.type === 'delete') {
+        const idx = merged.findIndex(m => m.name === change.name || (change.oldName && m.name === change.oldName));
+        if (idx !== -1) merged.splice(idx, 1);
+      }
+    }
+    if (hasAddedOrRenamed) {
+      sortMemberList(merged);
+    }
+    return merged;
+  }
+
+  /**
+   * 排程人員變更（支援多態呼叫：(campusId, change, rollbackFn, immediate) 或 (change, rollbackFn, immediate)）
+   * 包含隊列聚合、改名鏈追蹤、自我消除等深模組行為。
+   */
+  scheduleMemberSync(campusIdOrChange, changeOrRollback, rollbackOrImmediate, immediate = false) {
+    let targetCampusId, change, rollbackFn, isImmediate;
+
+    if (typeof campusIdOrChange === 'string') {
+      targetCampusId = campusIdOrChange;
+      change = changeOrRollback;
+      rollbackFn = rollbackOrImmediate;
+      isImmediate = Boolean(immediate);
+    } else {
+      change = campusIdOrChange;
+      rollbackFn = changeOrRollback;
+      isImmediate = Boolean(rollbackOrImmediate);
+      targetCampusId = (change && change.campusId) || this.getCurrentCampusId();
+    }
+
+    if (change) {
+      if (change.type === 'modify') {
+        const targetName = change.oldName || change.name;
+        const existing = this.queue.find(item =>
+          item.campusId === targetCampusId &&
+          item.change && (
+            (item.change.type === 'modify' && (item.change.name === targetName || (item.change.oldName && item.change.oldName === targetName))) ||
+            (item.change.type === 'add' && item.change.name === targetName)
+          )
+        );
+        if (existing) {
+          if (existing.change.type === 'add') {
+            existing.change.name = change.name;
+            existing.change.role = change.role;
+            existing.change.stage = change.stage;
+            existing.change.defaults = Array.isArray(change.defaults) ? [...change.defaults] : [];
+            if (change.otherGroupId !== undefined) existing.change.otherGroupId = change.otherGroupId;
+          } else {
+            const originalOldName = existing.change.oldName || existing.change.name;
+            existing.change = change;
+            if (originalOldName) {
+              existing.change.oldName = originalOldName;
+            }
+          }
+        } else {
+          this.queue.push({ campusId: targetCampusId, change, rollbackFn });
+        }
+      } else if (change.type === 'delete') {
+        const addIndex = this.queue.findIndex(item =>
+          item.campusId === targetCampusId && item.change && item.change.type === 'add' && item.change.name === change.name
+        );
+        if (addIndex !== -1) {
+          this.queue.splice(addIndex, 1);
+        } else {
+          this.queue.push({ campusId: targetCampusId, change, rollbackFn });
+        }
+      } else {
+        this.queue.push({ campusId: targetCampusId, change, rollbackFn });
+      }
+    }
+
+    this.onSyncStatusChange(this.getPendingCount());
+
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+
+    if (isImmediate) {
+      this.flushMemberSync();
+      return;
+    }
+
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.flushMemberSync();
+    }, this.debounceMs);
+  }
+
+  /**
+   * 立即將佇列批次送至伺服器，處理回滾與記憶體快照同步
+   */
+  async flushMemberSync() {
+    if (this.isInFlight) return;
+
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+
+    if (this.queue.length === 0) {
+      this.onSyncStatusChange(this.getPendingCount());
+      return;
+    }
+
+    const targetCampusId = this.queue[0].campusId || this.getCurrentCampusId();
+    if (!targetCampusId) return;
+
+    const batch = [];
+    const remaining = [];
+    for (const item of this.queue) {
+      if (item.campusId === targetCampusId) batch.push(item);
+      else remaining.push(item);
+    }
+    this.queue = remaining;
+
+    const changes = batch.map(b => b.change);
+    this.isInFlight = true;
+    this.onSyncStatusChange(this.getPendingCount());
+
+    try {
+      if (typeof this.apiClient.applyMemberChanges !== 'function') {
+        throw new Error('apiClient.applyMemberChanges 未定義');
+      }
+
+      const result = await this.apiClient.applyMemberChanges(targetCampusId, { changes });
+      if (result && result.success) {
+        let merged = null;
+        if (Array.isArray(result.members)) {
+          merged = this.mergeServerMembersWithPendingQueue(result.members, this.queue, targetCampusId);
+        }
+
+        this.onSuccess(targetCampusId, merged, result.affectedMembers, result.warnings);
+
+        if (result.warnings && result.warnings.length > 0) {
+          this.onToast(`已儲存名單（部分衝突已自動排除）：\n${result.warnings.join('\n')}`, 'warning');
+        } else if (this.queue.length === 0) {
+          this.onToast('人員變更已自動儲存', 'success');
+        }
+      } else {
+        throw new Error(result && result.error ? result.error : '伺服器儲存失敗');
+      }
+    } catch (e) {
+      for (let i = batch.length - 1; i >= 0; i--) {
+        if (typeof batch[i].rollbackFn === 'function') {
+          try { batch[i].rollbackFn(); } catch (err) {}
+        }
+      }
+      this.onRollback(targetCampusId, batch, e);
+      this.onToast(`人員儲存失敗 (${e.message})，已自動復原名單`, 'error');
+    } finally {
+      this.isInFlight = false;
+      this.onSyncStatusChange(this.getPendingCount());
+      if (this.queue.length > 0) {
+        this.scheduleMemberSync(null, null, null, true);
+      }
+    }
+  }
+
+  /**
+   * 與 flushMemberSync 等價之語法糖
+   */
+  flush() {
+    return this.flushMemberSync();
+  }
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { MemberStore, sortMemberList };
+}
+
+
+// ==========================================
+// ===== CampusStore 前端深模組 =====
+// ==========================================
+
+/**
+ * 小排管理 0ms 樂觀自動同步與回退管線深模組
+ * 封裝排序序號正規化、分類分組、防抖計時器、快照比對 (防止無實質變更的無意義儲存) 與失敗回退。
+ */
+class CampusStore {
+  /**
+   * @param {Object} [options]
+   * @param {Object} [options.apiClient] API Client 物件，需提供 applyCampusChanges(campuses)
+   * @param {Function} [options.onSyncStatusChange] 同步狀態計數變更通知 (pendingCount) => void
+   * @param {Function} [options.onToast] 提示通知 (msg, type) => void
+   * @param {Function} [options.onSuccess] 儲存成功回調 () => void
+   * @param {Function} [options.onRollback] 失敗回退回調 (rollbackSnapshot, error) => void
+   * @param {Function} [options.getCurrentCampuses] 取得當前校園狀態回調 () => { campuses, archivedCampuses }
+   * @param {number} [options.debounceMs=400] 防抖時間（毫秒）
+   */
+  constructor(options = {}) {
+    this.apiClient = options.apiClient || {};
+    this.onSyncStatusChange = options.onSyncStatusChange || (() => {});
+    this.onToast = options.onToast || (() => {});
+    this.onSuccess = options.onSuccess || (() => {});
+    this.onRollback = options.onRollback || (() => {});
+    this.getCurrentCampuses = options.getCurrentCampuses || (() => ({ campuses: [], archivedCampuses: [] }));
+    this.debounceMs = options.debounceMs ?? 400;
+
+    this.timer = null;
+    this.isInFlight = false;
+    this.rollbackSnapshot = null;
+    this.hasPending = false;
+  }
+
+  /**
+   * 建立當前校園狀態深拷貝快照
+   * @param {Array} campuses 啟用校園清單
+   * @param {Array} archivedCampuses 封存校園清單
+   * @returns {{ campuses: Array, archivedCampuses: Array }}
+   */
+  captureSnapshot(campuses, archivedCampuses) {
+    return {
+      campuses: JSON.parse(JSON.stringify(campuses || [])),
+      archivedCampuses: JSON.parse(JSON.stringify(archivedCampuses || []))
+    };
+  }
+
+  /**
+   * 比對兩個校園清單是否實質完全一致
+   * @param {Array} listA
+   * @param {Array} listB
+   * @returns {boolean}
+   */
+  areCampusListsEqual(listA, listB) {
+    if (!Array.isArray(listA) || !Array.isArray(listB)) return false;
+    if (listA.length !== listB.length) return false;
+    for (let i = 0; i < listA.length; i++) {
+      const a = listA[i];
+      const b = listB[i];
+      if (a.id !== b.id || a.name !== b.name || a.category !== b.category || (a.sort || 0) !== (b.sort || 0)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * 取得目前正在排程或傳輸中的校園同步筆數
+   * @returns {number}
+   */
+  getPendingCount() {
+    return (this.hasPending ? 1 : 0) + (this.isInFlight ? 1 : 0);
+  }
+
+  /**
+   * 檢查是否有未完成之校園排程或待同步快照
+   * @returns {boolean}
+   */
+  hasPendingSync() {
+    return this.hasPending || Boolean(this.rollbackSnapshot);
+  }
+
+  /**
+   * 重新正規化校園排序號與分類順序
+   * @param {Array} campuses
+   */
+  reorderAndSortCampuses(campuses) {
+    if (!Array.isArray(campuses)) return;
+
+    // 重新整理排序序號
+    const groups = {};
+    campuses.forEach(c => {
+      const cat = c.category || '其他';
+      if (!groups[cat]) groups[cat] = [];
+      groups[cat].push(c);
+    });
+    Object.values(groups).forEach(list => {
+      list.sort((a, b) => (a.sort || 0) - (b.sort || 0)).forEach((c, idx) => {
+        c.sort = idx + 1;
+      });
+    });
+
+    // 依類別與序號排序 campuses 保持與試算表實體列一致
+    const categoryOrder = { '高中': 1, '國中': 2, '社區排': 3 };
+    campuses.sort((a, b) => {
+      const catA = categoryOrder[a.category] || 99;
+      const catB = categoryOrder[b.category] || 99;
+      if (catA !== catB) return catA - catB;
+      return (a.sort || 0) - (b.sort || 0);
+    });
+  }
+
+  /**
+   * 排程小排同步（支援立即送出或防抖延遲）
+   * @param {Object} [prevSnapshot] 操作前回退快照
+   * @param {boolean} [immediate=false] 是否立即 flush
+   */
+  scheduleCampusSync(prevSnapshot, immediate = false) {
+    this.hasPending = true;
+    if (!this.rollbackSnapshot && prevSnapshot) {
+      this.rollbackSnapshot = prevSnapshot;
+    }
+    this.onSyncStatusChange(this.getPendingCount());
+
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+
+    if (immediate) {
+      this.flushCampusSync();
+      return;
+    }
+
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.flushCampusSync();
+    }, this.debounceMs);
+  }
+
+  /**
+   * 立即將校園變更批次同步至後端試算表
+   * @param {Array} [currentCampuses] 當前啟用校園清單
+   * @param {Array} [currentArchivedCampuses] 當前封存校園清單
+   */
+  async flushCampusSync(currentCampuses, currentArchivedCampuses) {
+    if (this.isInFlight) return;
+
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+
+    if (!this.hasPending) {
+      this.onSyncStatusChange(this.getPendingCount());
+      return;
+    }
+
+    this.hasPending = false;
+    const rollback = this.rollbackSnapshot;
+    this.rollbackSnapshot = null;
+    this.isInFlight = true;
+    this.onSyncStatusChange(this.getPendingCount());
+
+    const activeCampuses = currentCampuses || this.getCurrentCampuses().campuses || [];
+    const archivedCampuses = currentArchivedCampuses || this.getCurrentCampuses().archivedCampuses || [];
+
+    this.reorderAndSortCampuses(activeCampuses);
+
+    // 檢查是否與 rollback 快照完全一致（無實質變更時避免無意義儲存與網路請求）
+    if (rollback &&
+        this.areCampusListsEqual(rollback.campuses, activeCampuses) &&
+        this.areCampusListsEqual(rollback.archivedCampuses, archivedCampuses)) {
+      this.isInFlight = false;
+      this.onSyncStatusChange(this.getPendingCount());
+      return;
+    }
+
+    try {
+      if (typeof this.apiClient.applyCampusChanges !== 'function') {
+        throw new Error('apiClient.applyCampusChanges 未定義');
+      }
+
+      const allCampusesToSave = [
+        ...activeCampuses.map(c => ({ ...c, isArchived: false })),
+        ...archivedCampuses.map(c => ({ ...c, isArchived: true }))
+      ];
+
+      const result = await this.apiClient.applyCampusChanges(allCampusesToSave);
+      if (result && result.success) {
+        this.onSuccess();
+        this.onToast('小排變更已自動儲存', 'success');
+      } else {
+        throw new Error(result && result.error ? result.error : '儲存失敗');
+      }
+    } catch (e) {
+      this.onRollback(rollback, e);
+      this.onToast(`小排儲存失敗 (${e.message})，已自動復原`, 'error');
+    } finally {
+      this.isInFlight = false;
+      this.onSyncStatusChange(this.getPendingCount());
+      if (this.hasPending) {
+        this.scheduleCampusSync(null, true);
+      }
+    }
+  }
+
+  /**
+   * 與 flushCampusSync 等價之語法糖
+   */
+  flush() {
+    return this.flushCampusSync();
+  }
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { CampusStore };
+}
+
+
+/**
+ * stats_aggregator.js
+ * 
+ * 統計計算與時間軸深模組（純資料運算、零 DOM、零樣式字串）
+ * 包含：
+ * 1. Timeline: 時間軸、週次動態生成與日期間距平移工具（以週日代表當週區間）
+ * 2. StatsAggregator: 多維索引構建、排除服事者/家長、扣除暫停週、計算 KPI 與校園排行榜
+ */
+
+/**
+ * Timeline
+ * 時間軸與週次計算工具（純函式、無 DOM 依賴）
+ * 統一以「週日」代表當週區間（對齊點名應用規範）
+ */
+const Timeline = {
+  /** 格式化日期為 YYYY-MM-DD */
+  formatDate(date) {
+    if (!date) return '';
+    const d = (date instanceof Date) ? date : new Date(date);
+    if (isNaN(d.getTime())) return '';
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  },
+
+  /** 取得給定日期的週一日期（時間歸零） */
+  getMonday(date) {
+    let d;
+    if (typeof date === 'string' && /^\d{4}-\d{2}-\d{2}/.test(date)) {
+      const parts = date.slice(0, 10).split('-').map(Number);
+      d = new Date(parts[0], parts[1] - 1, parts[2]);
+    } else if (date) {
+      d = new Date(date);
+    } else {
+      d = new Date();
+    }
+    const day = d.getDay();
+    const diff = day === 0 ? -6 : 1 - day;
+    const monday = new Date(d);
+    monday.setDate(d.getDate() + diff);
+    monday.setHours(0, 0, 0, 0);
+    return monday;
+  },
+
+  /** 取得給定日期所在週的週日日期（代表該週日期，時間歸零） */
+  getSunday(date) {
+    const mon = this.getMonday(date);
+    const sun = new Date(mon);
+    sun.setDate(mon.getDate() + 6);
+    sun.setHours(0, 0, 0, 0);
+    return sun;
+  },
+
+  /** 取得當前週的最新週日字串（最大允許迄日） */
+  getMaxAllowedSundayStr(refDate = new Date()) {
+    return this.formatDate(this.getSunday(refDate));
+  },
+
+  /**
+   * 計算最近 N 週的區間 [startDate, endDate]（均為週日 YYYY-MM-DD）
+   * @param {number} count 週數（如 10, 20）
+   * @param {Date|string} [refDate] 參考基準日（預設為今天）
+   */
+  recentWeeks(count, refDate = new Date()) {
+    const curSun = this.getSunday(refDate);
+    const startSun = new Date(curSun);
+    startSun.setDate(curSun.getDate() - (count - 1) * 7);
+    return {
+      startDate: this.formatDate(startSun),
+      endDate: this.formatDate(curSun)
+    };
+  },
+
+  /**
+   * 計算學期區間 [startDate, endDate]（均為週日 YYYY-MM-DD）
+   * @param {number} year 年份
+   * @param {'SPRING'|'AUTUMN'|'CURRENT'} term 學期別
+   * @param {Date|string} [refDate] 參考基準日
+   */
+  semester(year, term = 'CURRENT', refDate = new Date()) {
+    const curSun = this.getSunday(refDate);
+    let isSpring;
+    if (term === 'SPRING') {
+      isSpring = true;
+    } else if (term === 'AUTUMN') {
+      isSpring = false;
+    } else {
+      const refD = (refDate instanceof Date) ? refDate : new Date(refDate);
+      const m = refD.getMonth() + 1;
+      isSpring = (m >= 2 && m <= 7);
+    }
+
+    const startM = isSpring ? 3 : 9;
+    const endM = isSpring ? 6 : 12;
+    const sSun = this.getSunday(new Date(year, startM - 1, 1));
+    const lastDayOfEndM = new Date(year, endM, 0);
+    let eSun = this.getSunday(lastDayOfEndM);
+
+    // 若學期仍在進行中，結束週日不可超過基準週日
+    if (eSun > curSun) {
+      eSun = curSun;
+    }
+
+    return {
+      startDate: this.formatDate(sSun),
+      endDate: this.formatDate(eSun)
+    };
+  },
+
+  /**
+   * 平移時間軸窗口
+   * @param {string} startDate 起始週日 YYYY-MM-DD
+   * @param {string} endDate 結束週日 YYYY-MM-DD
+   * @param {number} deltaWeeks 平移週數（負為往過去，正為往未來）
+   * @param {Date|string} [maxSun] 最大允許週日（預設為基準週日）
+   */
+  shift(startDate, endDate, deltaWeeks, maxSun = this.getSunday(new Date())) {
+    const sParts = startDate.split('-').map(Number);
+    const eParts = endDate.split('-').map(Number);
+    const s = new Date(sParts[0], sParts[1] - 1, sParts[2]);
+    let e = new Date(eParts[0], eParts[1] - 1, eParts[2]);
+
+    s.setDate(s.getDate() + deltaWeeks * 7);
+    e.setDate(e.getDate() + deltaWeeks * 7);
+
+    const maxLimit = (maxSun instanceof Date) ? maxSun : this.getSunday(maxSun);
+    if (e > maxLimit) {
+      const diffDays = Math.round((e.getTime() - maxLimit.getTime()) / (24 * 3600 * 1000));
+      e = new Date(maxLimit);
+      s.setDate(s.getDate() - diffDays);
+    }
+
+    return {
+      startDate: this.formatDate(s),
+      endDate: this.formatDate(e)
+    };
+  },
+
+  /**
+   * 根據起訖週日動態展開所有週次資訊清單
+   * @param {string} startDate 起始週日 YYYY-MM-DD
+   * @param {string} endDate 結束週日 YYYY-MM-DD
+   * @returns {Array<{ weekStr: string, sunStr: string, shortLabel: string, label: string, monday: Date, sunday: Date }>}
+   */
+  buildWeekList(startDate, endDate) {
+    if (!startDate || !endDate) return [];
+    const sParts = startDate.split('-').map(Number);
+    const eParts = endDate.split('-').map(Number);
+    const startSun = this.getSunday(new Date(sParts[0], sParts[1] - 1, sParts[2]));
+    const endSun = this.getSunday(new Date(eParts[0], eParts[1] - 1, eParts[2]));
+    if (startSun > endSun) return [];
+
+    const weeks = [];
+    const curSun = new Date(startSun);
+    while (curSun <= endSun) {
+      const sun = new Date(curSun);
+      const mon = this.getMonday(sun);
+      const monStr = this.formatDate(mon);
+      const sunStr = this.formatDate(sun);
+      const shortLabel = `${sun.getMonth() + 1}/${sun.getDate()}`;
+      const fullLabel = `${mon.getFullYear()}/${mon.getMonth() + 1}/${mon.getDate()} ~ ${sun.getMonth() + 1}/${sun.getDate()}`;
+
+      weeks.push({
+        weekStr: monStr, // 週一字串（對齊後端點名原始資料的週次記錄）
+        sunStr: sunStr,   // 週日字串
+        shortLabel: shortLabel,
+        label: fullLabel,
+        monday: mon,
+        sunday: sun
+      });
+
+      curSun.setDate(curSun.getDate() + 7);
+    }
+    return weeks;
+  }
+};
+
+/**
+ * StatsAggregator
+ * 統計指標計算深模組（純資料運算、零 DOM、零樣式字串）
+ * 集中管理多維點名比對索引、週次截斷、暫停週排除、KPI 計算與校園排行榜狀態機。
+ */
+const StatsAggregator = {
+  /**
+   * 聚合統計數據
+   * @param {Object} params
+   * @param {Object} [params.attendanceByCampus] 各校點名紀錄快取 { [campusId]: Array<{week, type, name, role}> }
+   * @param {Array} [params.campuses] 校園清單 [{id, name, category, suspendedWeeks: []}]
+   * @param {string} params.startDate 起始週日 (YYYY-MM-DD)
+   * @param {string} params.endDate 結束週日 (YYYY-MM-DD)
+   * @param {string} [params.targetCampusId='ALL'] 目標校園 ID 或 'ALL'
+   * @param {boolean} [params.excludeSuspended=false] 是否排除暫停週（僅在指定個別校園時生效）
+   * @returns {Object} 統計報告（純量領域模型，不包含 HTML/CSS/Chart.js 樣式）
+   */
+  aggregate({
+    attendanceByCampus = {},
+    campuses = [],
+    startDate,
+    endDate,
+    targetCampusId = 'ALL',
+    excludeSuspended = false
+  } = {}) {
+    // 1. 動態展開週次清單
+    const weeks = Timeline.buildWeekList(startDate, endDate);
+
+    // 2. 構建全域點名比對索引（排除服事者/家長，直接依點名紀錄篩選）
+    const attMap = {};    // key: campusId|normWeek|type -> Set<name>
+    const gospelMap = {}; // key: campusId|normWeek -> Set<gospelName>
+
+    for (const [cid, recList] of Object.entries(attendanceByCampus || {})) {
+      if (!Array.isArray(recList)) continue;
+      for (const r of recList) {
+        if (!r || r.role === '服事者/家長') continue;
+
+        const normWeek = (r.week || '').replace(/[/\.]/g, '-').slice(0, 10);
+        const key = cid + '|' + normWeek + '|' + r.type;
+        if (!attMap[key]) attMap[key] = new Set();
+        attMap[key].add(r.name);
+
+        if (r.type === '出席' && (r.role === '男界朋友' || r.role === '女界朋友')) {
+          const gKey = cid + '|' + normWeek;
+          if (!gospelMap[gKey]) gospelMap[gKey] = new Set();
+          gospelMap[gKey].add(r.name);
+        }
+      }
+    }
+
+    // 3. 確定目標校園與暫停週排除
+    const activeCampuses = Array.isArray(campuses) ? campuses : [];
+    const targetCampuses = targetCampusId === 'ALL'
+      ? activeCampuses
+      : activeCampuses.filter(c => c.id === targetCampusId);
+
+    const selectedCampus = (targetCampusId !== 'ALL')
+      ? (activeCampuses.find(c => c.id === targetCampusId) || null)
+      : null;
+
+    const suspendedWeeks = (selectedCampus && Array.isArray(selectedCampus.suspendedWeeks))
+      ? selectedCampus.suspendedWeeks
+      : [];
+
+    const isExcluding = !!(selectedCampus && excludeSuspended && suspendedWeeks.length > 0);
+    const effectiveWeeks = isExcluding
+      ? weeks.filter(w => !suspendedWeeks.includes(w.weekStr))
+      : weeks;
+    const suspendedCount = weeks.length - effectiveWeeks.length;
+
+    // 4. 計算走勢數列與彙總
+    const labels = effectiveWeeks.map(w => w.shortLabel);
+    const attendSeries = [];
+    const gospelSeries = [];
+    const praySeries = [];
+    const outreachSeries = [];
+    let totalAttendSum = 0;
+    let totalGospelSum = 0;
+    let latestAttendCount = 0;
+    let prevAttendCount = 0;
+    let latestGospelCount = 0;
+    let latestWeekLabel = '';
+
+    effectiveWeeks.forEach((w, idx) => {
+      let weekAttend = 0;
+      let weekGospel = 0;
+      let weekPray = 0;
+      let weekOutreach = 0;
+
+      for (const c of targetCampuses) {
+        const attendKey = c.id + '|' + w.weekStr + '|出席';
+        weekAttend += (attMap[attendKey] || new Set()).size;
+
+        const gKey = c.id + '|' + w.weekStr;
+        weekGospel += (gospelMap[gKey] || new Set()).size;
+
+        const prayKey = c.id + '|' + w.weekStr + '|禱告';
+        weekPray += (attMap[prayKey] || new Set()).size;
+
+        const outreachKey = c.id + '|' + w.weekStr + '|傳福音';
+        weekOutreach += (attMap[outreachKey] || new Set()).size;
+      }
+
+      attendSeries.push(weekAttend);
+      gospelSeries.push(weekGospel);
+      praySeries.push(weekPray);
+      outreachSeries.push(weekOutreach);
+      totalAttendSum += weekAttend;
+      totalGospelSum += weekGospel;
+
+      if (idx === effectiveWeeks.length - 1) {
+        latestAttendCount = weekAttend;
+        latestGospelCount = weekGospel;
+        latestWeekLabel = w.shortLabel;
+      }
+      if (idx === effectiveWeeks.length - 2) {
+        prevAttendCount = weekAttend;
+      }
+    });
+
+    // 5. 計算三大 KPI 指標（平均出席、平均福音朋友、活躍福音朋友）
+    const avgAttend = effectiveWeeks.length > 0 ? (totalAttendSum / effectiveWeeks.length) : 0;
+    const avgGospel = effectiveWeeks.length > 0 ? (totalGospelSum / effectiveWeeks.length) : 0;
+
+    const gospelFriendAttendanceCounts = {}; // key: campusId|name -> 出席次數
+    effectiveWeeks.forEach(w => {
+      for (const c of targetCampuses) {
+        const gSet = gospelMap[c.id + '|' + w.weekStr];
+        if (gSet) {
+          gSet.forEach(name => {
+            const fKey = c.id + '|' + name;
+            gospelFriendAttendanceCounts[fKey] = (gospelFriendAttendanceCounts[fKey] || 0) + 1;
+          });
+        }
+      }
+    });
+
+    const totalFriends = Object.keys(gospelFriendAttendanceCounts).length;
+    let threshold = 0;
+    let activeFriendsCount = 0;
+    if (totalFriends > 0) {
+      threshold = totalGospelSum / totalFriends;
+      activeFriendsCount = Object.values(gospelFriendAttendanceCounts).filter(cnt => cnt > threshold).length;
+    }
+
+    // 6. 計算跨校園數據排行（依全體 activeCampuses 於原始 weeks 區間統計並由高到低排序）
+    const latestWeekStr = weeks.length > 0 ? weeks[weeks.length - 1].weekStr : '';
+    const prevWeekStr = weeks.length > 1 ? weeks[weeks.length - 2].weekStr : '';
+
+    const campusRankings = activeCampuses.map(c => {
+      let cAttendSum = 0;
+      let cGospelSum = 0;
+      let cLatestAttend = 0;
+      let cPrevAttend = 0;
+
+      weeks.forEach((w, idx) => {
+        const attendKey = c.id + '|' + w.weekStr + '|出席';
+        const attendCount = (attMap[attendKey] || new Set()).size;
+        cAttendSum += attendCount;
+
+        const gKey = c.id + '|' + w.weekStr;
+        cGospelSum += (gospelMap[gKey] || new Set()).size;
+
+        if (idx === weeks.length - 1) cLatestAttend = attendCount;
+        if (idx === weeks.length - 2) cPrevAttend = attendCount;
+      });
+
+      const cAvg = weeks.length > 0 ? (cAttendSum / weeks.length) : 0;
+      const cSuspended = Array.isArray(c.suspendedWeeks) ? c.suspendedWeeks : [];
+      const isLatestSuspended = latestWeekStr ? cSuspended.includes(latestWeekStr) : false;
+      const isPrevSuspended = prevWeekStr ? cSuspended.includes(prevWeekStr) : false;
+
+      let trendStatus = 'FLAT';
+      const diff = cLatestAttend - cPrevAttend;
+
+      if (isLatestSuspended) {
+        trendStatus = 'THIS_WEEK_SUSPENDED';
+      } else if (isPrevSuspended) {
+        trendStatus = 'PREV_WEEK_SUSPENDED';
+      } else if (diff > 0) {
+        trendStatus = 'UP';
+      } else if (diff < 0) {
+        trendStatus = 'DOWN';
+      } else {
+        trendStatus = 'FLAT';
+      }
+
+      return {
+        id: c.id,
+        name: c.name,
+        category: c.category || '',
+        latestAttend: cLatestAttend,
+        prevAttend: cPrevAttend,
+        avgAttend: parseFloat(cAvg.toFixed(1)),
+        formattedAvg: cAvg.toFixed(1),
+        gospelTotal: cGospelSum,
+        trendStatus,
+        diff
+      };
+    });
+
+    campusRankings.sort((a, b) => b.avgAttend - a.avgAttend);
+
+    return {
+      window: {
+        startDate,
+        endDate,
+        totalWeeks: weeks.length,
+        effectiveWeeksCount: effectiveWeeks.length,
+        suspendedCount,
+        isExcludingSuspended: isExcluding,
+        weeks,
+        effectiveWeeks
+      },
+      series: {
+        labels,
+        attend: attendSeries,
+        gospel: gospelSeries,
+        pray: praySeries,
+        outreach: outreachSeries
+      },
+      latest: {
+        attend: latestAttendCount,
+        prevAttend: prevAttendCount,
+        gospel: latestGospelCount,
+        weekLabel: latestWeekLabel
+      },
+      kpis: {
+        attendance: {
+          total: totalAttendSum,
+          avg: parseFloat(avgAttend.toFixed(1)),
+          formattedAvg: avgAttend.toFixed(1)
+        },
+        gospel: {
+          total: totalGospelSum,
+          avg: parseFloat(avgGospel.toFixed(1)),
+          formattedAvg: avgGospel.toFixed(1)
+        },
+        activeGospel: {
+          count: activeFriendsCount,
+          totalFriends: totalFriends,
+          threshold: parseFloat(threshold.toFixed(1)),
+          formattedThreshold: threshold.toFixed(1)
+        }
+      },
+      campusRankings
+    };
+  },
+
+  /**
+   * 排序各校明細排行名單（純函式運算，不修改原陣列）
+   * 
+   * 排序規範：
+   * 1. 走勢權重：本週暫停視為 -2000、上週暫停視為 -1000、其餘按點名差額 (最新週 - 前一週)。
+   * 2. 平手打破 (Tie-breaker)：主排序數值相同時啟用同向次要排序（主升則次升、主降則次降）。
+   *    - 主排序非 avgAttend 時次要比 avgAttend；主排序為 avgAttend 時次要比 latestAttend。
+   *    - 若仍相同，最後以校園名稱繁體筆畫 (localeCompare zh-Hant) 做確定性平手打破。
+   * 
+   * @param {Array<Object>} rankings 各校明細清單
+   * @param {string} [column='avgAttend'] 排序欄位 ('name' | 'latestAttend' | 'avgAttend' | 'gospelTotal' | 'trend')
+   * @param {string} [direction='desc'] 排序方向 ('desc' | 'asc')
+   * @returns {Array<Object>} 排序後的全新陣列
+   */
+  sortRankings(rankings, column = 'avgAttend', direction = 'desc') {
+    if (!Array.isArray(rankings)) return [];
+    const list = [...rankings];
+    const mult = (direction === 'asc') ? 1 : -1;
+
+    const getTrendScore = (item) => {
+      if (!item) return 0;
+      const status = item.trendStatus || '';
+      if (status === 'THIS_WEEK_SUSPENDED' || status === '本週暫停' || status === '本周暫停') {
+        return -2000;
+      }
+      if (status === 'PREV_WEEK_SUSPENDED' || status === '上週暫停') {
+        return -1000;
+      }
+      return Number(item.diff) || 0;
+    };
+
+    return list.sort((a, b) => {
+      let diff = 0;
+      if (column === 'name') {
+        diff = (a.name || '').localeCompare(b.name || '', 'zh-Hant');
+      } else if (column === 'latestAttend') {
+        diff = (Number(a.latestAttend) || 0) - (Number(b.latestAttend) || 0);
+      } else if (column === 'gospelTotal') {
+        diff = (Number(a.gospelTotal) || 0) - (Number(b.gospelTotal) || 0);
+      } else if (column === 'trend') {
+        diff = getTrendScore(a) - getTrendScore(b);
+      } else {
+        // 預設 avgAttend
+        diff = (Number(a.avgAttend) || 0) - (Number(b.avgAttend) || 0);
+      }
+
+      if (diff !== 0) return mult * diff;
+
+      // 主要排序數字相同時啟用次要排序：次要排序方向與主要排序保持一致 (升序即升序，降序即降序)
+      // 若主排序非 avgAttend 則次要比 avgAttend；若主排序為 avgAttend 則次要比 latestAttend
+      let secDiff = 0;
+      if (column !== 'avgAttend') {
+        secDiff = (Number(a.avgAttend) || 0) - (Number(b.avgAttend) || 0);
+      } else {
+        secDiff = (Number(a.latestAttend) || 0) - (Number(b.latestAttend) || 0);
+      }
+
+      if (secDiff !== 0) return mult * secDiff;
+
+      // 若仍平手，最後以校園名稱做確定性排序
+      return (a.name || '').localeCompare(b.name || '', 'zh-Hant');
+    });
+  }
+};
+
+
+    // ===== 伺服器端預載資料 (Server-side Injected Data) =====
+    // SERVER_PRELOADED_DATA 由宿主 HTML 在全域預先注入（若未定義則預設為 null）
+    if (typeof SERVER_PRELOADED_DATA === 'undefined') {
+      var SERVER_PRELOADED_DATA = null;
+    }
+
+    // ===== 應用程式狀態 =====
+    const state = {
+      campuses: [],           // [{id, name, category, sort}]
+      archivedCampuses: [],   // [{id, name, category, sort, isArchived}]
+      campusesSnapshot: null, // 校園編輯模式快照 (JSON string)
+      membersByCampus: {},    // { [campusId]: [{name, count, role, defaults: [...]}, ...] } 全校人員快取
+      currentCampusId: null,  // 當前選中的校園 ID（用於後端呼叫）
+      currentCampus: null,    // 當前選中的校園名稱（用於顯示）
+      members: [],            // 當前選中校園的人員名單
+      membersSnapshot: null,  // 人員編輯模式快照 (JSON string)
+      nameChanges: [],        // 編輯模式中的改名歷程 [{oldName, newName}]
+      weekOffset: 0,          // 0=本週, -1=上週, 1=下週
+      campusEditMode: false,  // 校園編輯模式
+      memberEditMode: false,  // 人員編輯模式
+      roleFilter: '全部',     // 身分篩選（'全部' = 不篩選）
+      searchQuery: '',        // 姓名搜尋關鍵字（已忽略空白）
+      filterPanelOpen: false, // 篩選面板開關狀態
+      helpPanelOpen: false,   // 說明面板開關狀態
+      confirmCallback: null   // 確認對話框的回調函式
+    };
+
+    // ===== 校園與分類領域規則 =====
+    const CampusDomain = {
+      COMMUNITY_CATEGORY: '社區排',
+      SCHOOL_CATEGORIES: ['國中', '高中'],
+
+      /**
+       * 解析校園物件或分類字串之分類名稱
+       * @param {Object|string} campusOrCat 校園物件或分類字串
+       * @returns {string} 分類名稱（如 '國中', '高中', '社區排'）
+       */
+      getCat(campusOrCat) {
+        if (!campusOrCat) return '';
+        return (typeof campusOrCat === 'string') ? campusOrCat : (campusOrCat.category || '');
+      },
+
+      /**
+       * 判斷是否為學生校園排（國中或高中）
+       * @param {Object|string} campusOrCat 校園物件或分類字串
+       * @returns {boolean}
+       */
+      isSchool(campusOrCat) {
+        return this.SCHOOL_CATEGORIES.includes(this.getCat(campusOrCat));
+      },
+
+      /**
+       * 判斷是否為社區排
+       * @param {Object|string} campusOrCat 校園物件或分類字串
+       * @returns {boolean}
+       */
+      isCommunity(campusOrCat) {
+        return this.getCat(campusOrCat) === this.COMMUNITY_CATEGORY;
+      }
+    };
+
+    // ===== 工具函式 =====
+
+    /** 顯示 loading */
+    function showLoading() {
+      document.getElementById('loading').classList.add('active');
+    }
+
+    /** 隱藏 loading */
+    function hideLoading() {
+      document.getElementById('loading').classList.remove('active');
+    }
+
+    /** 顯示 toast 通知 */
+    function showToast(message, type = '') {
+      const container = document.getElementById('toast-container');
+      const toast = document.createElement('div');
+      toast.className = 'toast' + (type ? ' ' + type : '');
+      toast.textContent = message;
+      container.appendChild(toast);
+      setTimeout(() => toast.remove(), 3000);
+    }
+
+    let savedBodyScrollY = 0;
+
+    /** 開啟 modal */
+    function openModal(id) {
+      if (!document.body.classList.contains('modal-open')) {
+        savedBodyScrollY = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
+        document.body.style.top = `-${savedBodyScrollY}px`;
+        document.body.classList.add('modal-open');
+      }
+
+      const modalEl = document.getElementById(id);
+      if (modalEl) modalEl.classList.add('active');
+
+      // 重置身分與預設值選擇器
+      if (id === 'modal-add-member') {
+        document.querySelectorAll('#role-selector .role-btn').forEach(b => b.classList.remove('selected'));
+        setSelectedDefaults('add-defaults-selector', []);
+
+        const currentCampus = state.campuses.find(c => c.id === state.currentCampusId) ||
+                              (state.archivedCampuses && state.archivedCampuses.find(c => c.id === state.currentCampusId));
+        const isComm = CampusDomain.isCommunity(currentCampus);
+
+        const campusBox = document.getElementById('add-campus-group-box');
+        if (campusBox) {
+          campusBox.style.display = isComm ? 'block' : 'none';
+          if (isComm) {
+            populateCampusOptions('add-member-other-campus', '');
+          }
+        }
+
+        const defaultStage = CampusDomain.isSchool(currentCampus) ? CampusDomain.getCat(currentCampus) : '高中';
+        setStageSelector('add-stage-selector', defaultStage);
+      }
+
+      // 重置新增校園對話框狀態
+      if (id === 'modal-add-campus') {
+        const nameInput = document.getElementById('input-campus-name');
+        if (nameInput) nameInput.value = '';
+        setCampusCategorySelector('add', '高中');
+      }
+
+      // 自動聚焦第一個可見 input（僅限非觸控裝置，避免手機鍵盤無預警彈出造成畫面劇烈位移）
+      const isTouch = window.matchMedia('(pointer: coarse)').matches;
+      if (!isTouch) {
+        const input = document.getElementById(id).querySelector('input:not([type="hidden"])');
+        if (input) setTimeout(() => input.focus(), 100);
+      }
+    }
+
+    /** 設定特定 category-selector 的選中狀態 */
+    function setCampusCategorySelector(modalType, categoryValue) {
+      const containerId = (modalType === 'add') ? 'add-campus-category-selector' : 'edit-campus-category-selector';
+      const container = document.getElementById(containerId);
+      if (!container) return;
+      const val = categoryValue || '高中';
+      container.querySelectorAll('.category-btn').forEach(b => {
+        b.classList.toggle('selected', b.dataset.cat === val);
+      });
+    }
+
+    /** 選擇小排類別按鈕 */
+    function selectCampusCategory(modalType, category) {
+      setCampusCategorySelector(modalType, category);
+    }
+
+    /** 取得目前選中的小排類別 */
+    function getSelectedCampusCategory(modalType) {
+      const containerId = (modalType === 'add') ? 'add-campus-category-selector' : 'edit-campus-category-selector';
+      const container = document.getElementById(containerId);
+      if (!container) return '高中';
+      const selected = container.querySelector('.category-btn.selected');
+      return selected ? selected.dataset.cat : '高中';
+    }
+
+    /** 填充所屬校園下拉選單（僅列出國中與高中校園） */
+    function populateCampusOptions(selectId, selectedValue) {
+      const select = document.getElementById(selectId);
+      if (!select) return;
+      select.innerHTML = '<option value="">無 / 其他</option>';
+      const schoolCampuses = state.campuses.filter(c => CampusDomain.isSchool(c));
+      schoolCampuses.forEach(c => {
+        const opt = document.createElement('option');
+        opt.value = c.id;
+        opt.textContent = `${c.name} (${c.category})`;
+        if (c.id === selectedValue) opt.selected = true;
+        select.appendChild(opt);
+      });
+    }
+
+    /** 設定特定 stage-selector 的選中狀態 */
+    function setStageSelector(containerId, stageValue) {
+      const container = document.getElementById(containerId);
+      if (!container) return;
+      const val = stageValue || '其他';
+      container.querySelectorAll('.stage-btn').forEach(b => {
+        b.classList.toggle('selected', b.dataset.stage === val);
+      });
+    }
+
+    /** 選擇學段按鈕 */
+    function selectStage(modalType, stage) {
+      const containerId = (modalType === 'add') ? 'add-stage-selector' : 'edit-stage-selector';
+      setStageSelector(containerId, stage);
+    }
+
+    /** 取得目前選中的學段 */
+    function getSelectedStage(modalType) {
+      const containerId = (modalType === 'add') ? 'add-stage-selector' : 'edit-stage-selector';
+      const container = document.getElementById(containerId);
+      if (!container) return '其他';
+      const selected = container.querySelector('.stage-btn.selected');
+      return selected ? selected.dataset.stage : '其他';
+    }
+
+    /** 在 Modal 中切換所屬校園時，自動帶入該校園的分類作為學段預設值 */
+    function handleSelectCampusInModal(modalType) {
+      const selectId = (modalType === 'add') ? 'add-member-other-campus' : 'edit-member-other-campus';
+      const select = document.getElementById(selectId);
+      if (!select) return;
+      const cid = select.value;
+      if (cid) {
+        const campus = state.campuses.find(c => c.id === cid) ||
+                       (state.archivedCampuses && state.archivedCampuses.find(c => c.id === cid));
+        if (campus && CampusDomain.isSchool(campus)) {
+          const containerId = (modalType === 'add') ? 'add-stage-selector' : 'edit-stage-selector';
+          setStageSelector(containerId, CampusDomain.getCat(campus));
+        }
+      }
+    }
+
+    /** 選擇身分 */
+    function selectRole(btn) {
+      document.querySelectorAll('#role-selector .role-btn').forEach(b => b.classList.remove('selected'));
+      btn.classList.add('selected');
+    }
+
+    /** 切換 Modal 內的預設參與選項 */
+    function toggleDefaultSelection(btn) {
+      btn.classList.toggle('selected');
+    }
+
+    /** 取得目前選中的預設參與選項清單 */
+    function getSelectedDefaults(containerId) {
+      const container = document.getElementById(containerId);
+      if (!container) return [];
+      const selected = [];
+      container.querySelectorAll('.default-toggle-btn.selected').forEach(btn => {
+        selected.push(btn.dataset.type);
+      });
+      return selected;
+    }
+
+    /** 設定預設參與選項按鈕的選中狀態 */
+    function setSelectedDefaults(containerId, defaultsList) {
+      const container = document.getElementById(containerId);
+      if (!container) return;
+      const list = Array.isArray(defaultsList) ? defaultsList : [];
+      container.querySelectorAll('.default-toggle-btn').forEach(btn => {
+        btn.classList.toggle('selected', list.includes(btn.dataset.type));
+      });
+    }
+
+    /** 關閉 modal */
+    function closeModal(id) {
+      const modalEl = document.getElementById(id);
+      if (modalEl) {
+        modalEl.classList.remove('active');
+      }
+
+      // 若所有 modal 皆已關閉，恢復 body 滾動狀態與捲動位置
+      if (!document.querySelector('.modal-backdrop.active')) {
+        const restoreY = savedBodyScrollY;
+        document.body.classList.remove('modal-open');
+        document.body.style.top = '';
+        window.scrollTo(0, restoreY);
+      }
+
+      // 清空 input
+      if (modalEl) {
+        const inputs = modalEl.querySelectorAll('input, select');
+        inputs.forEach(el => {
+          if (el.tagName === 'SELECT') el.selectedIndex = 0;
+          else el.value = '';
+        });
+      }
+    }
+
+    /** 取得某週的週一日期 (依 weekOffset) */
+    function getWeekMonday(offset) {
+      const now = new Date();
+      const day = now.getDay(); // 0=Sun, 1=Mon, ...
+      const diff = day === 0 ? -6 : 1 - day; // 調整到本週一
+      const monday = new Date(now);
+      monday.setDate(now.getDate() + diff + (offset * 7));
+      monday.setHours(0, 0, 0, 0);
+      return monday;
+    }
+
+    /** 格式化日期為 YYYY-MM-DD */
+    function formatDate(date) {
+      const y = date.getFullYear();
+      const m = String(date.getMonth() + 1).padStart(2, '0');
+      const d = String(date.getDate()).padStart(2, '0');
+      return `${y}-${m}-${d}`;
+    }
+
+    /** 格式化日期為顯示用 M/D */
+    function formatDateDisplay(date) {
+      return `${date.getMonth() + 1}/${date.getDate()}`;
+    }
+
+    /** 取得當前選擇的週次字串（週一日期） */
+    function getCurrentWeekStr() {
+      return formatDate(getWeekMonday(state.weekOffset));
+    }
+
+    /** 設定當前校園與週次快取索引 (委派至 AttendanceStore 極速建構) */
+    function filterAttendanceForWeek() {
+      attendanceStore.setCurrentContext(state.currentCampusId, getCurrentWeekStr());
+    }
+
+    /** 取得週次顯示標籤 */
+    function getWeekLabel() {
+      const monday = getWeekMonday(state.weekOffset);
+      const sunday = new Date(monday);
+      sunday.setDate(monday.getDate() + 6);
+      let tag = '';
+      if (state.weekOffset === 0) tag = '<span class="week-tag">本週</span>';
+      else if (state.weekOffset === -1) tag = '<span class="week-tag">上週</span>';
+      else if (state.weekOffset === 1) tag = '<span class="week-tag">下週</span>';
+      return `${tag}${formatDateDisplay(monday)} ~ ${formatDateDisplay(sunday)}`;
+    }
+
+    /** 更新統計顯示 (委派至 AttendanceStore O(1) 統計) */
+    function updateAttendanceCount() {
+      const counts = attendanceStore.getWeekCounts();
+      document.getElementById('attendance-count').textContent =
+        `出席${counts.attend} / 禱告${counts.pray} / 福音${counts.gospel}`;
+      updateSuspensionUI();
+    }
+
+    // ===== 小排暫停狀態管理 =====
+
+    /** 判斷當前校園於當前週次是否處於「小排暫停」狀態 */
+    function isCurrentWeekSuspended() {
+      if (!state.currentCampusId) return false;
+      const campus = (state.campuses || []).find(c => c.id === state.currentCampusId);
+      if (!campus || !Array.isArray(campus.suspendedWeeks)) return false;
+      const currentWeek = getCurrentWeekStr();
+      return campus.suspendedWeeks.includes(currentWeek);
+    }
+
+    /** 更新「本週小排暫停」按鈕、成員卡片與套用預設按鈕之狀態 */
+    function updateSuspensionUI() {
+      const bar = document.getElementById('suspend-bar');
+      const btn = document.getElementById('btn-suspend');
+      const memberList = document.getElementById('member-list');
+      const fabApply = document.getElementById('btn-apply-defaults');
+      if (!bar || !btn) return;
+
+      // 1. 人員編輯模式下隱藏小排暫停按鈕
+      if (state.memberEditMode) {
+        bar.style.display = 'none';
+        if (memberList) memberList.classList.remove('suspended');
+        return;
+      }
+      bar.style.display = 'flex';
+
+      const isSuspended = isCurrentWeekSuspended();
+      const counts = attendanceStore.getWeekCounts();
+      const hasRecords = counts.attend > 0 || counts.pray > 0 || counts.gospel > 0;
+
+      if (isSuspended) {
+        // 狀態 B：已確認暫停
+        btn.classList.add('is-suspended');
+        btn.classList.remove('disabled');
+        btn.innerHTML = '🚫 本週小排已暫停（點擊恢復點名）';
+        btn.title = '點擊以取消小排暫停並恢復點名';
+
+        if (memberList) memberList.classList.add('suspended');
+        if (fabApply) {
+          fabApply.classList.add('disabled');
+          fabApply.setAttribute('aria-disabled', 'true');
+        }
+      } else {
+        // 狀態 A：未暫停
+        btn.classList.remove('is-suspended');
+        btn.innerHTML = '⏸️ 本週小排暫停';
+
+        if (hasRecords) {
+          btn.classList.add('disabled');
+          btn.title = '本週已有部分點名，請先清空點名紀錄才能設為暫停';
+        } else {
+          btn.classList.remove('disabled');
+          btn.title = '設定本週小排暫停';
+        }
+
+        if (memberList) memberList.classList.remove('suspended');
+        if (fabApply && !state.memberEditMode) {
+          fabApply.classList.remove('disabled');
+          fabApply.removeAttribute('aria-disabled');
+        }
+      }
+    }
+
+    /** 點擊【本週小排暫停】按鈕 */
+    async function handleToggleSuspendClick() {
+      if (!state.currentCampusId) return;
+
+      const campusId = state.currentCampusId;
+      const weekStr = getCurrentWeekStr();
+      const campus = (state.campuses || []).find(c => c.id === campusId);
+      if (!campus) return;
+
+      if (!Array.isArray(campus.suspendedWeeks)) {
+        campus.suspendedWeeks = [];
+      }
+
+      const currentlySuspended = campus.suspendedWeeks.includes(weekStr);
+      const counts = attendanceStore.getWeekCounts();
+      const hasRecords = counts.attend > 0 || counts.pray > 0 || counts.gospel > 0;
+
+      // 防呆：若未暫停且已有紀錄，提示使用者清空
+      if (!currentlySuspended && hasRecords) {
+        showToast('本週已有部分點名，請先清空點名紀錄才能設為暫停', 'error');
+        return;
+      }
+
+      if (getPendingSaveCount() > 0) {
+        showToast('請等待背景點名儲存完成後再切換', 'error');
+        return;
+      }
+
+      const targetSuspended = !currentlySuspended;
+
+      // 樂觀更新 (Optimistic UI Update)
+      if (targetSuspended) {
+        if (!campus.suspendedWeeks.includes(weekStr)) {
+          campus.suspendedWeeks.push(weekStr);
+          campus.suspendedWeeks.sort();
+        }
+      } else {
+        campus.suspendedWeeks = campus.suspendedWeeks.filter(w => w !== weekStr);
+      }
+      updateSuspensionUI();
+
+      try {
+        const res = await callServer('toggleCampusSuspension', campusId, weekStr, targetSuspended);
+        if (res.success) {
+          if (Array.isArray(res.suspendedWeeks)) {
+            campus.suspendedWeeks = res.suspendedWeeks;
+          }
+          showToast(targetSuspended ? '已設定本週小排暫停' : '已取消本週小排暫停，恢復正常點名', 'success');
+        } else {
+          throw new Error(res.error || '伺服器儲存失敗');
+        }
+      } catch (e) {
+        // Rollback
+        if (currentlySuspended) {
+          if (!campus.suspendedWeeks.includes(weekStr)) {
+            campus.suspendedWeeks.push(weekStr);
+            campus.suspendedWeeks.sort();
+          }
+        } else {
+          campus.suspendedWeeks = campus.suspendedWeeks.filter(w => w !== weekStr);
+        }
+        updateSuspensionUI();
+        showToast('操作失敗：' + e.message, 'error');
+      }
+    }
+
+    // ===== google.script.run 的 Promise 包裝 =====
+    /**
+     * 包裝 Google Apps Script 非同步 RPC 呼叫為標準 Promise
+     * @param {string} functionName 後端公開函式名稱
+     * @param {...*} args 傳遞給後端函式之參數
+     * @returns {Promise<*>}
+     */
+    function callServer(functionName, ...args) {
+      return new Promise((resolve, reject) => {
+        if (typeof google === 'undefined' || !google.script || !google.script.run) {
+          reject(new Error('google.script.run 未定義'));
+          return;
+        }
+
+        const runner = google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler((err) => {
+            const msg = (err && err.message) ? err.message : String(err || '未知錯誤');
+            reject(new Error(msg));
+          });
+
+        if (typeof runner[functionName] !== 'function') {
+          reject(new Error(`後端函式「${functionName}」不存在。請確認已將 Code.gs 複製並在 Apps Script 部署為「新版本」！`));
+          return;
+        }
+
+        runner[functionName](...args);
+      });
+    }
+
+    // ===== AttendanceStore 前端深模組實例化 =====
+    const attendanceStore = new AttendanceStore({
+      apiClient: {
+        batchUpdateAttendance: (...args) => callServer('batchUpdateAttendance', ...args),
+        applyDefaultAttendance: (...args) => callServer('applyDefaultAttendance', ...args),
+        getAttendanceHistory: (startWeek, endWeek) => callServer('getAttendanceHistory', '', startWeek, endWeek)
+      },
+      onSyncStatusChange: () => {
+        updatePendingSaveIndicator();
+      },
+      onToast: (msg, type) => {
+        showToast(msg, type);
+      },
+      debounceMs: 400,
+      maxRetries: 3
+    });
+
+    // ===== MemberStore 前端深模組實例化 =====
+    const memberStore = new MemberStore({
+      apiClient: {
+        applyMemberChanges: (...args) => callServer('applyMemberChanges', ...args)
+      },
+      getCurrentCampusId: () => state.currentCampusId,
+      onSyncStatusChange: () => {
+        updatePendingSaveIndicator();
+      },
+      onToast: (msg, type) => {
+        showToast(msg, type);
+      },
+      onSuccess: (campusId, mergedMembers, affectedMembers) => {
+        if (Array.isArray(mergedMembers)) {
+          state.membersByCampus[campusId] = mergedMembers;
+          if (state.currentCampusId === campusId) {
+            state.members = mergedMembers;
+            if (typeof renderMembers === 'function') renderMembers();
+          }
+        }
+        if (Array.isArray(affectedMembers)) {
+          affectedMembers.forEach(aff => {
+            const list = state.membersByCampus[aff.campusId];
+            if (Array.isArray(list)) {
+              const target = list.find(m => m.name === aff.name);
+              if (target) target.otherGroupId = aff.otherGroupId;
+            }
+          });
+        }
+      },
+      onRollback: (campusId) => {
+        if (state.currentCampusId === campusId) {
+          state.membersByCampus[campusId] = state.members;
+          if (typeof renderMembers === 'function') renderMembers();
+        }
+      },
+      debounceMs: 400
+    });
+
+    // ===== CampusStore 前端深模組實例化 =====
+    const campusStore = new CampusStore({
+      apiClient: {
+        applyCampusChanges: (...args) => callServer('applyCampusChanges', ...args)
+      },
+      getCurrentCampuses: () => ({
+        campuses: state.campuses || [],
+        archivedCampuses: state.archivedCampuses || []
+      }),
+      onSyncStatusChange: () => {
+        updatePendingSaveIndicator();
+      },
+      onToast: (msg, type) => {
+        showToast(msg, type);
+      },
+      onRollback: (rollback) => {
+        if (rollback) {
+          state.campuses = rollback.campuses;
+          state.archivedCampuses = rollback.archivedCampuses;
+          if (typeof renderCampuses === 'function') renderCampuses();
+        }
+      },
+      debounceMs: 400
+    });
+
+    /** 計算目前所有正在防抖等待或背景儲存中的操作數 */
+    function getPendingSaveCount() {
+      let count = 0;
+      if (typeof attendanceStore !== 'undefined') count += attendanceStore.getPendingCount();
+      if (typeof memberStore !== 'undefined') count += memberStore.getPendingCount();
+      else if (typeof getMemberPendingCount === 'function') count += getMemberPendingCount();
+      if (typeof campusStore !== 'undefined') count += campusStore.getPendingCount();
+      else if (typeof getCampusPendingCount === 'function') count += getCampusPendingCount();
+      return count;
+    }
+
+    /** 更新背景儲存計數器指示燈 */
+    function updatePendingSaveIndicator() {
+      const count = getPendingSaveCount();
+      let indicator = document.getElementById('pending-save');
+      if (count > 0) {
+        if (!indicator) {
+          indicator = document.createElement('div');
+          indicator.id = 'pending-save';
+          document.body.appendChild(indicator);
+        }
+
+        indicator.textContent = `儲存中 (${count})...`;
+        indicator.style.display = 'block';
+      } else if (indicator) {
+        indicator.style.display = 'none';
+      }
+    }
+
+    if (typeof module !== 'undefined' && module.exports) {
+      module.exports = { CampusDomain, state };
+    }
+
+// ===== 首頁：全域資料快取與載入 =====
+
+    /** 將後端全域資料存入前端狀態並渲染首頁（0 毫秒極速載入） */
+    function applyLoadedData(data) {
+      if (!data) return;
+      state.campuses = data.campuses || [];
+      state.archivedCampuses = data.archivedCampuses || [];
+      state.membersByCampus = data.membersByCampus || {};
+      if (typeof sortMemberList === 'function') {
+        Object.values(state.membersByCampus).forEach(list => sortMemberList(list));
+      }
+      attendanceStore.loadInitialData(data.attendanceByCampus || {}, data.minLoadedWeek || '');
+      renderCampuses();
+    }
+
+    /** 從雲端非同步載入或刷新全域資料 */
+    async function loadInitialDataFromCloud(showFeedback = false) {
+      if (showFeedback) showLoading();
+      try {
+        const result = await callServer('getInitialAppData');
+        if (result.success) {
+          applyLoadedData(result.data);
+
+          // 若當前在點名頁面，同步刷新當前校園
+          if (state.currentCampusId) {
+            state.members = state.membersByCampus[state.currentCampusId] || [];
+            filterAttendanceForWeek();
+            renderMembers();
+            updateAttendanceCount();
+          }
+
+          if (showFeedback) showToast('已從雲端同步最新資料', 'success');
+        } else {
+          if (showFeedback) showToast('同步失敗：' + (result.error || '未知錯誤'), 'error');
+        }
+
+      } catch (e) {
+        if (showFeedback) showToast('連線失敗：' + e.message, 'error');
+      } finally {
+        if (showFeedback) hideLoading();
+      }
+    }
+
+    /**
+     * 合併從後端取得的更早歷史點名資料 (委派至 AttendanceStore 頭部拼接)
+     */
+    function mergeAttendanceHistory(historyByCampus, newMinLoadedWeek) {
+      attendanceStore.mergeAttendanceHistory(historyByCampus, newMinLoadedWeek);
+      if (state.currentCampusId) {
+        renderMembers();
+        updateAttendanceCount();
+      }
+    }
+
+    /**
+     * 確保指定起始週（targetStartWeek）以上的點名資料已存在快取中 (委派至 AttendanceStore)
+     */
+    async function ensureAttendanceRange(targetStartWeek) {
+      showLoading();
+      try {
+        const ok = await attendanceStore.ensureAttendanceRange(targetStartWeek);
+        if (state.currentCampusId) {
+          renderMembers();
+          updateAttendanceCount();
+        }
+        return ok;
+      } finally {
+        hideLoading();
+      }
+    }
+
+    /** 渲染校園列表（使用 DocumentFragment 批次組裝，避免 DOM 重繪） */
+    function renderCampuses() {
+      const container = document.getElementById('campus-list');
+
+      // 更新首頁底部管理按鈕群組顯示狀態
+      updateCampusFooterUI();
+
+      if (state.campuses.length === 0) {
+        container.innerHTML = `
+          <div class="empty-state">
+            <div class="icon">🏫</div>
+            <p>尚無小排，點擊下方按鈕新增</p>
+          </div>`;
+        return;
+      }
+
+      const fragment = document.createDocumentFragment();
+
+      // 依分類分組
+      const groups = {};
+      state.campuses.forEach(c => {
+        const cat = c.category || '其他';
+        if (!groups[cat]) groups[cat] = [];
+        groups[cat].push(c);
+      });
+
+      // 分組順序：高中 → 國中 → 社區排 → 其他
+      const order = ['高中', '國中', '社區排', '其他'];
+      order.forEach(cat => {
+        if (!groups[cat] || groups[cat].length === 0) return;
+        const title = document.createElement('div');
+        title.className = 'group-title';
+        title.textContent = cat;
+        fragment.appendChild(title);
+        const grid = document.createElement('div');
+        grid.className = 'campus-grid';
+        grid.dataset.category = cat;
+        const sortedList = groups[cat].sort((a, b) => (a.sort || 0) - (b.sort || 0));
+        sortedList.forEach((campus, index) => {
+          const card = document.createElement('div');
+          card.className = 'campus-card' + (state.campusEditMode ? ' edit-mode' : '');
+          card.dataset.id = campus.id;
+          card.dataset.name = campus.name;
+          card.dataset.category = cat;
+
+          // 校園名稱
+          const nameEl = document.createElement('span');
+          nameEl.className = 'campus-card-name';
+          nameEl.textContent = campus.name;
+          card.appendChild(nameEl);
+
+          // 編輯小排按鈕
+          const renameBadge = document.createElement('span');
+          renameBadge.className = 'rename-badge';
+          renameBadge.textContent = '✏️';
+          renameBadge.title = '編輯小排';
+          card.appendChild(renameBadge);
+
+          // 刪除按鈕
+          const deleteBadge = document.createElement('span');
+          deleteBadge.className = 'delete-badge';
+          deleteBadge.textContent = '✕';
+          deleteBadge.title = '封存小排';
+          card.appendChild(deleteBadge);
+
+          // 編輯模式：左右/前後移動按鈕
+          if (state.campusEditMode) {
+            const reorderBar = document.createElement('div');
+            reorderBar.className = 'campus-reorder-bar';
+
+            // ◀ 前移按鈕
+            const btnLeft = document.createElement('button');
+            btnLeft.type = 'button';
+            btnLeft.className = 'campus-reorder-btn';
+            btnLeft.innerHTML = '◀';
+            btnLeft.title = '往前移動一位';
+            btnLeft.dataset.dir = '-1';
+            if (index === 0) btnLeft.disabled = true;
+            reorderBar.appendChild(btnLeft);
+
+            // ▶ 後移按鈕
+            const btnRight = document.createElement('button');
+            btnRight.type = 'button';
+            btnRight.className = 'campus-reorder-btn';
+            btnRight.innerHTML = '▶';
+            btnRight.title = '往後移動一位';
+            btnRight.dataset.dir = '1';
+            if (index === sortedList.length - 1) btnRight.disabled = true;
+            reorderBar.appendChild(btnRight);
+            card.appendChild(reorderBar);
+          }
+
+          grid.appendChild(card);
+        });
+
+        fragment.appendChild(grid);
+      });
+
+      if (container.replaceChildren) {
+        container.replaceChildren(fragment);
+      } else {
+        container.innerHTML = '';
+        container.appendChild(fragment);
+      }
+    }
+
+    /** Campus List 全域事件委派（單一事件監聽，杜絕重複閉包與記憶體洩漏） */
+    function initCampusListDelegation() {
+      const container = document.getElementById('campus-list');
+      if (!container) return;
+      container.addEventListener('click', (e) => {
+        const card = e.target.closest('.campus-card');
+        if (!card) return;
+        const campusId = card.dataset.id;
+        const campusName = card.dataset.name;
+        if (!campusId) return;
+
+        // 改名按鈕
+        const renameBtn = e.target.closest('.rename-badge');
+        if (renameBtn) {
+          e.stopPropagation();
+          openRenameCampusModal(campusId, campusName);
+          return;
+        }
+
+        // 刪除/封存按鈕
+        const deleteBtn = e.target.closest('.delete-badge');
+        if (deleteBtn) {
+          e.stopPropagation();
+          confirmDelete('小排', campusName, () => handleDeleteCampus(campusId, campusName));
+          return;
+        }
+
+        // 排序按鈕 (◀ 前移 / ▶ 後移)
+        const reorderBtn = e.target.closest('.campus-reorder-btn');
+        if (reorderBtn) {
+          e.stopPropagation();
+          if (reorderBtn.disabled) return;
+          const dir = parseInt(reorderBtn.dataset.dir, 10);
+          if (dir) moveCampus(campusId, dir);
+          return;
+        }
+
+        // 點擊卡片本體：進入點名頁（非編輯模式下）
+        if (!state.campusEditMode) {
+          enterAttendancePage(campusId, campusName);
+        }
+      });
+    }
+
+    /** 本地生成校園/小排流水號 ID (CAMP_xxx 或 COMM_xxx) */
+    function generateLocalCampusId(category) {
+      const isComm = CampusDomain.isCommunity(category);
+      const prefix = isComm ? 'COMM_' : 'CAMP_';
+      let maxNum = 0;
+      const allList = [...state.campuses, ...(state.archivedCampuses || [])];
+      const regex = isComm ? /^COMM_(\d+)$/ : /^CAMP_(\d+)$/;
+      allList.forEach(c => {
+        const match = String(c.id).match(regex);
+        if (match) {
+          const num = parseInt(match[1], 10);
+          if (num > maxNum) maxNum = num;
+        }
+      });
+
+      return prefix + String(maxNum + 1).padStart(3, '0');
+    }
+
+    /** 在同一分類中移動校園順序（0 毫秒立即重排） */
+    function moveCampus(campusId, direction) {
+      const campus = state.campuses.find(c => c.id === campusId);
+      if (!campus) return;
+      const category = campus.category || '其他';
+      const categoryCampuses = state.campuses
+        .filter(c => (c.category || '其他') === category)
+        .sort((a, b) => (a.sort || 0) - (b.sort || 0));
+      const idx = categoryCampuses.findIndex(c => c.id === campusId);
+      if (idx === -1) return;
+      const targetIdx = idx + direction;
+      if (targetIdx < 0 || targetIdx >= categoryCampuses.length) return;
+
+      // 交換兩者的 sort 屬性
+      const tempSort = categoryCampuses[idx].sort;
+      categoryCampuses[idx].sort = categoryCampuses[targetIdx].sort;
+      categoryCampuses[targetIdx].sort = tempSort;
+
+      const prevSnapshot = captureCampusSnapshot();
+
+      // 重新校準該分類所有校園的 sort 為連續遞增 1, 2, 3...
+      categoryCampuses.sort((a, b) => (a.sort || 0) - (b.sort || 0));
+      categoryCampuses.forEach((c, i) => {
+        c.sort = i + 1;
+      });
+
+      renderCampuses();
+      scheduleCampusSync(prevSnapshot);
+    }
+
+    /** 更新首頁底部管理按鈕群組與頂部切換列顯示狀態 */
+    function updateCampusFooterUI() {
+      const isEditing = !!state.campusEditMode;
+      const manageBtn = document.getElementById('btn-manage-campus');
+      const saveBtn = document.getElementById('btn-save-campus');
+      const addBtn = document.getElementById('btn-add-campus');
+      const restoreBtn = document.getElementById('btn-restore-campus');
+      const topNavBar = document.getElementById('top-nav-bar');
+
+      if (manageBtn) manageBtn.style.display = isEditing ? 'none' : '';
+      if (saveBtn) saveBtn.style.display = isEditing ? '' : 'none';
+      if (addBtn) addBtn.style.display = isEditing ? '' : 'none';
+      if (topNavBar) topNavBar.style.display = isEditing ? 'none' : '';
+
+      if (restoreBtn) {
+        const archivedCount = (state.archivedCampuses && state.archivedCampuses.length) ? state.archivedCampuses.length : 0;
+        if (isEditing && archivedCount > 0) {
+          restoreBtn.style.display = '';
+          restoreBtn.textContent = `📂 恢復封存小排 (${archivedCount})`;
+        } else {
+          restoreBtn.style.display = 'none';
+        }
+      }
+    }
+
+    /** 進入小排管理模式 */
+    function enterCampusEditMode() {
+      state.campusEditMode = true;
+      state.campusesSnapshot = JSON.stringify(state.campuses);
+      updateCampusFooterUI();
+      renderCampuses();
+    }
+
+// ===== 小排管理同步委派 (委派至 CampusStore 前端深模組) =====
+
+    /**
+     * 建立當前啟用與封存校園的快照 (委派至 CampusStore)
+     * @returns {{ campuses: Array, archivedCampuses: Array }}
+     */
+    function captureCampusSnapshot() {
+      if (typeof campusStore !== 'undefined') {
+        return campusStore.captureSnapshot(state.campuses, state.archivedCampuses);
+      }
+      return {
+        campuses: JSON.parse(JSON.stringify(state.campuses || [])),
+        archivedCampuses: JSON.parse(JSON.stringify(state.archivedCampuses || []))
+      };
+    }
+
+    /**
+     * 取得目前待同步的小排操作數 (委派至 CampusStore)
+     * @returns {number}
+     */
+    function getCampusPendingCount() {
+      return (typeof campusStore !== 'undefined') ? campusStore.getPendingCount() : 0;
+    }
+
+    /**
+     * 排程小排清單同步 (委派至 CampusStore)
+     * @param {Object} [prevSnapshot] 操作前快照
+     * @param {boolean} [immediate=false] 是否立即同步
+     */
+    function scheduleCampusSync(prevSnapshot, immediate = false) {
+      if (typeof campusStore !== 'undefined') {
+        campusStore.scheduleCampusSync(prevSnapshot, immediate);
+      }
+    }
+
+    /**
+     * 立即送出小排清單變更至後端 (委派至 CampusStore)
+     * @returns {Promise<void>}
+     */
+    function flushCampusSync() {
+      if (typeof campusStore !== 'undefined') {
+        return campusStore.flushCampusSync(state.campuses, state.archivedCampuses);
+      }
+    }
+
+    /**
+     * 比對兩個校園清單是否實質相等 (委派至 CampusStore)
+     * @param {Array} listA
+     * @param {Array} listB
+     * @returns {boolean}
+     */
+    function areCampusListsEqual(listA, listB) {
+      if (typeof campusStore !== 'undefined') {
+        return campusStore.areCampusListsEqual(listA, listB);
+      }
+      return false;
+    }
+
+    /** 退出小排管理模式 */
+    function exitCampusEditMode() {
+      if (typeof campusStore !== 'undefined' && campusStore.hasPendingSync()) {
+        campusStore.flushCampusSync(state.campuses, state.archivedCampuses);
+      }
+      state.campusEditMode = false;
+      state.campusesSnapshot = null;
+      updateCampusFooterUI();
+      renderCampuses();
+    }
+
+    /** 新增校園（0ms 樂觀更新 + 防抖背景同步，由 CampusStore 驅動） */
+    function handleAddCampus() {
+      const name = document.getElementById('input-campus-name').value.trim();
+      const category = getSelectedCampusCategory('add');
+      if (!name) { showToast('請輸入小排名稱', 'error'); return; }
+      if (!category) { showToast('請選擇分類', 'error'); return; }
+
+      // 檢查名稱是否重複
+      if (state.campuses.some(c => c.name === name)) {
+        showToast('小排名稱已存在於啟用清單', 'error');
+        return;
+      }
+
+      // 計算同分類最大 sort
+      let maxSort = 0;
+      state.campuses.forEach(c => {
+        if (c.category === category && (c.sort || 0) > maxSort) {
+          maxSort = c.sort;
+        }
+      });
+
+      const prevSnapshot = captureCampusSnapshot();
+
+      const newId = generateLocalCampusId(category);
+      state.campuses.push({
+        id: newId,
+        name: name,
+        category: category,
+        sort: maxSort + 1,
+        isArchived: false
+      });
+
+      closeModal('modal-add-campus');
+      renderCampuses();
+      scheduleCampusSync(prevSnapshot);
+      showToast(`已新增「${name}」`, 'success');
+    }
+
+    /** 刪除校園（標記為封存，0ms 自動同步） */
+    function handleDeleteCampus(campusId, name) {
+      const idx = state.campuses.findIndex(c => c.id === campusId);
+      if (idx === -1) return;
+
+      const prevSnapshot = captureCampusSnapshot();
+
+      const archivedItem = state.campuses.splice(idx, 1)[0];
+      archivedItem.isArchived = true;
+      if (!state.archivedCampuses) state.archivedCampuses = [];
+      state.archivedCampuses.push(archivedItem);
+
+      renderCampuses();
+      scheduleCampusSync(prevSnapshot);
+      showToast(`已將「${name}」移至封存`, 'success');
+    }
+
+    // ===== 恢復封存校園 =====
+    /** 開啟恢復封存小排對話框 */
+    function openRestoreCampusModal() {
+      const container = document.getElementById('restore-campus-list');
+      container.innerHTML = '';
+      if (!state.archivedCampuses || state.archivedCampuses.length === 0) {
+        container.innerHTML = '<div style="text-align:center;padding:20px;color:#94a3b8;font-size:13px;">目前無任何封存小排</div>';
+        openModal('modal-restore-campus');
+        return;
+      }
+
+      state.archivedCampuses.forEach(campus => {
+        const item = document.createElement('div');
+        item.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;';
+        const info = document.createElement('div');
+        info.innerHTML = `<span style="font-weight:600;color:#1e293b;">${campus.name}</span> <span style="font-size:12px;color:#64748b;margin-left:6px;">(${campus.category || '其他'})</span>`;
+        const btn = document.createElement('button');
+        btn.className = 'btn btn-primary btn-sm';
+        btn.textContent = '恢復';
+        btn.style.padding = '4px 12px';
+        btn.onclick = () => handleRestoreCampus(campus.id, campus.name);
+        item.appendChild(info);
+        item.appendChild(btn);
+        container.appendChild(item);
+      });
+
+      openModal('modal-restore-campus');
+    }
+
+    /**
+     * 執行恢復已封存小排（0ms 樂觀更新 + 防抖背景同步，由 CampusStore 驅動）
+     * @param {string} campusId 校園 ID
+     * @param {string} name 校園名稱
+     */
+    function handleRestoreCampus(campusId, name) {
+      const idx = state.archivedCampuses.findIndex(c => c.id === campusId);
+      if (idx === -1) return;
+
+      const prevSnapshot = captureCampusSnapshot();
+
+      const restored = state.archivedCampuses.splice(idx, 1)[0];
+      restored.isArchived = false;
+      state.campuses.push(restored);
+      state.campuses.sort((a, b) => {
+        if (a.category === '高中' && b.category !== '高中') return -1;
+        if (a.category !== '高中' && b.category === '高中') return 1;
+        return (a.sort || 0) - (b.sort || 0);
+      });
+
+      closeModal('modal-restore-campus');
+      renderCampuses();
+      scheduleCampusSync(prevSnapshot);
+      showToast(`已成功恢復「${name}」小排`, 'success');
+    }
+
+    // ===== 校園編輯 =====
+
+    /** 開啟校園編輯 modal */
+    function openRenameCampusModal(campusId, currentName) {
+      const campus = state.campuses.find(c => c.id === campusId);
+      document.getElementById('rename-campus-id').value = campusId;
+      document.getElementById('input-rename-campus').value = campus ? campus.name : currentName;
+      const currentCat = campus ? (campus.category || '高中') : '高中';
+      setCampusCategorySelector('edit', currentCat);
+      openModal('modal-rename-campus');
+    }
+
+    /** 處理校園編輯（0ms 樂觀更新 + 防抖背景同步，由 CampusStore 驅動） */
+    function handleRenameCampus() {
+      const campusId = document.getElementById('rename-campus-id').value;
+      const newName = document.getElementById('input-rename-campus').value.trim();
+      const newCategory = getSelectedCampusCategory('edit');
+
+      if (!newName) { showToast('請輸入小排名稱', 'error'); return; }
+      if (!newCategory) { showToast('請選擇小排類別', 'error'); return; }
+
+      // 檢查新名稱是否被其他校園使用
+      if (state.campuses.some(c => c.id !== campusId && c.name === newName)) {
+        showToast('小排名稱已存在', 'error');
+        return;
+      }
+
+      const campus = state.campuses.find(c => c.id === campusId);
+      if (!campus) return;
+
+      // 若名稱與類別皆無變更，直接關閉彈窗，避免無意義儲存
+      if (campus.name === newName && (campus.category || '高中') === newCategory) {
+        closeModal('modal-rename-campus');
+        return;
+      }
+
+      const prevSnapshot = captureCampusSnapshot();
+
+      const oldCategory = campus.category;
+      campus.name = newName;
+      if (oldCategory !== newCategory) {
+        campus.category = newCategory;
+        // 若跨分類移動，將其排序設為新分類的最後一位
+        const sameCatCampuses = state.campuses.filter(c => c.category === newCategory && c.id !== campusId);
+        const maxSort = sameCatCampuses.reduce((max, c) => Math.max(max, c.sort || 0), 0);
+        campus.sort = maxSort + 1;
+      }
+
+      closeModal('modal-rename-campus');
+      renderCampuses();
+      scheduleCampusSync(prevSnapshot);
+      showToast(`已更新「${newName}」`, 'success');
+    }
+
+    // ===== 確認動作對話框 =====
+    /**
+     * 開啟通用確認動作 Modal 對話框
+     * @param {string} title 對話框標題
+     * @param {string} messageHtml 提示 HTML 內容
+     * @param {string} btnText 確認按鈕文字（預設 '確認'）
+     * @param {Function} callback 使用者點擊確認後的回調函式
+     */
+    function confirmAction(title, messageHtml, btnText, callback) {
+      document.getElementById('confirm-title').textContent = title;
+      document.getElementById('confirm-message').innerHTML = messageHtml;
+      const btn = document.getElementById('confirm-btn');
+      if (btn) btn.textContent = btnText || '確認';
+      state.confirmCallback = callback;
+      openModal('modal-confirm');
+    }
+
+    /**
+     * 開啟刪除對象確認對話框（校園或人員）
+     * @param {string} type 類型 ('小排' | '人位')
+     * @param {string} name 欲刪除的名稱
+     * @param {Function} callback 確認後回調函式
+     */
+    function confirmDelete(type, name, callback) {
+      let msg = `確定要刪除<span class="confirm-highlight">「${name}」</span>嗎？`;
+      if (type === '小排') {
+        msg += '<br><small style="color:var(--gray-500)">僅從列表移除，人員及紀錄將保留。</small>';
+      } else {
+        msg += '<br><small style="color:var(--gray-500)">將從人員名單移除，歷史出席紀錄將保留。</small>';
+      }
+
+      confirmAction(`確認刪除${type}`, msg, '刪除', callback);
+    }
+
+    /**
+     * 處理點擊對話框「確認」按鈕
+     */
+    function handleConfirm() {
+      closeModal('modal-confirm');
+      if (state.confirmCallback) {
+        state.confirmCallback();
+        state.confirmCallback = null;
+      }
+    }
+
+    // ===== 頁面 2：點名 =====
+
+    /** 進入點名頁面（0 毫秒瞬間切換） */
+    function enterAttendancePage(campusId, campusName) {
+      state.currentCampusId = campusId;
+      state.currentCampus = campusName;
+      state.weekOffset = 0;
+      state.memberEditMode = false;
+      updateEditMemberBtn();
+      resetFilter();
+
+      // 從前端全域快取立即取出該校資料 (0 毫秒)
+      state.members = state.membersByCampus[campusId] || [];
+      if (typeof sortMemberList === 'function') {
+        sortMemberList(state.members);
+      }
+      const currentCampus = state.campuses.find(c => c.id === campusId) ||
+                            (state.archivedCampuses && state.archivedCampuses.find(c => c.id === campusId));
+      if (currentCampus && CampusDomain.isSchool(currentCampus)) {
+        state.members.forEach(m => {
+          if (!m.stage || m.stage === '其他') {
+            m.stage = CampusDomain.getCat(currentCampus);
+          }
+        });
+      }
+
+      document.getElementById('main-view-header').style.display = 'none';
+      document.getElementById('page-home').style.display = 'none';
+      document.getElementById('page-stats').style.display = 'none';
+      document.getElementById('page-attendance').style.display = 'block';
+      document.getElementById('current-campus-name').textContent = campusName;
+      document.getElementById('week-label').innerHTML = getWeekLabel();
+      filterAttendanceForWeek();
+      renderMembers();
+      updateAttendanceCount();
+    }
+
+    /** 返回首頁（0 毫秒瞬間切換） */
+
+// ===== 統計與趨勢頁面狀態管理（以週日代表各週區間，迄日不超過要來之週日） =====
+    const statsState = {
+      currentTab: 'home',
+      rangeMode: 'W10',        // 'W10' | 'W20' | 'SEMESTER_CURRENT' | 'SEMESTER_SPRING' | 'SEMESTER_AUTUMN' | 'ALL' | 'CUSTOM'
+      startDate: '',           // 'YYYY-MM-DD' 當前生效的起始週日
+      endDate: '',             // 'YYYY-MM-DD' 當前生效的結束週日
+      selectedCampusId: 'ALL',
+      excludeSuspended: false, // 排除暫停週開關（預設未勾選，僅限各校模式）
+      activeMetrics: {
+        attend: true,
+        gospel: true,
+        pray: false,
+        outreach: false
+      },
+      chartInstance: null,
+      tableSort: {
+        column: 'avgAttend',
+        direction: 'desc'
+      },
+      lastReport: null
+    };
+
+    /** 取得給定日期的週一日期（委派至 Timeline 工具） */
+    function getMonday(date) {
+      return Timeline.getMonday(date);
+    }
+
+    /** 取得給定日期所在週的週日日期（代表該週日期，委派至 Timeline 工具） */
+    function getSunday(date) {
+      return Timeline.getSunday(date);
+    }
+
+    /** 取得當前週的最新週日字串（最大可選迄日，委派至 Timeline 工具） */
+    function getMaxAllowedSundayStr() {
+      return Timeline.getMaxAllowedSundayStr();
+    }
+
+    /** 主導航切換：首頁 (home) vs 趨勢統計 (stats) */
+    function switchMainTab(tabName) {
+      statsState.currentTab = tabName;
+      const tabHome = document.getElementById('tab-nav-home');
+      const tabStats = document.getElementById('tab-nav-stats');
+      const pageHome = document.getElementById('page-home');
+      const pageStats = document.getElementById('page-stats');
+      const pageAttendance = document.getElementById('page-attendance');
+      const mainHeader = document.getElementById('main-view-header');
+      const subTitle = document.getElementById('main-app-subtitle');
+      mainHeader.style.display = 'block';
+      pageAttendance.style.display = 'none';
+      if (tabName === 'home') {
+        tabHome.classList.add('active');
+        tabStats.classList.remove('active');
+        pageHome.style.display = 'block';
+        pageStats.style.display = 'none';
+        subTitle.textContent = '選擇小排開始點名';
+      } else {
+        tabStats.classList.add('active');
+        tabHome.classList.remove('active');
+        pageHome.style.display = 'none';
+        pageStats.style.display = 'block';
+        subTitle.textContent = '各校數據趨勢與即時統計';
+
+        // 第一次進入時初始化預設 10 週範圍
+        if (!statsState.startDate || !statsState.endDate) {
+          applyPresetRange('W10', false);
+        }
+
+        renderStatsPage();
+      }
+    }
+
+    /** 依預設模式計算並設定底層 [startDate, endDate]（均為週日），並自動同步至自訂輸入框 */
+    async function applyPresetRange(mode, triggerRender = true) {
+      statsState.rangeMode = mode;
+      const now = new Date();
+      if (mode === 'W10') {
+        const range = Timeline.recentWeeks(10, now);
+        statsState.startDate = range.startDate;
+        statsState.endDate = range.endDate;
+      } else if (mode === 'W20') {
+        const range = Timeline.recentWeeks(20, now);
+        statsState.startDate = range.startDate;
+        statsState.endDate = range.endDate;
+      } else if (mode === 'SEMESTER_CURRENT' || mode === 'SEMESTER_SPRING' || mode === 'SEMESTER_AUTUMN') {
+        const term = (mode === 'SEMESTER_SPRING') ? 'SPRING' : ((mode === 'SEMESTER_AUTUMN') ? 'AUTUMN' : 'CURRENT');
+        const range = Timeline.semester(now.getFullYear(), term, now);
+        statsState.startDate = range.startDate;
+        statsState.endDate = range.endDate;
+      } else if (mode === 'ALL') {
+        if (attendanceStore.minLoadedWeek && attendanceStore.minLoadedWeek !== '0000-00-00' && attendanceStore.minLoadedWeek !== '__ALL__') {
+          await ensureAttendanceRange('');
+        }
+        let earliest = Timeline.getMaxAllowedSundayStr(now);
+        for (const [cid, recList] of Object.entries(attendanceStore.attendanceByCampus || {})) {
+          for (const r of recList) {
+            if (r.week) {
+              const sunStr = Timeline.formatDate(Timeline.getSunday(r.week));
+              if (sunStr < earliest) earliest = sunStr;
+            }
+          }
+        }
+
+        statsState.startDate = earliest;
+        statsState.endDate = Timeline.getMaxAllowedSundayStr(now);
+      }
+
+      // 若指定區間早於快取最舊週，按需抓取更早歷史
+      if (mode !== 'ALL' && statsState.startDate && attendanceStore.minLoadedWeek && attendanceStore.minLoadedWeek !== '0000-00-00' && attendanceStore.minLoadedWeek !== '__ALL__' && statsState.startDate < attendanceStore.minLoadedWeek) {
+        await ensureAttendanceRange(statsState.startDate);
+      }
+
+      // 同步填入自訂起訖輸入框
+      syncDateInputs();
+
+      // 控制自訂列展開/隱藏
+      const customBar = document.getElementById('stats-custom-range-bar');
+      if (customBar) {
+        customBar.style.display = (mode === 'CUSTOM' ? 'flex' : 'none');
+      }
+
+      if (triggerRender) {
+        renderStatsPage();
+      }
+    }
+
+    /** 將當前生效的 startDate 與 endDate (週日) 同步寫入 input，並設定 max 限制不可超過本週日 */
+    function syncDateInputs() {
+      const maxSunStr = getMaxAllowedSundayStr();
+      const sInput = document.getElementById('stats-custom-start');
+      const eInput = document.getElementById('stats-custom-end');
+      if (sInput) {
+        sInput.max = maxSunStr;
+        if (statsState.startDate) sInput.value = statsState.startDate;
+      }
+
+      if (eInput) {
+        eInput.max = maxSunStr;
+        if (statsState.endDate) eInput.value = statsState.endDate;
+      }
+    }
+
+    /** 切換區間下拉選單 */
+    function handleStatsRangeModeChange() {
+      const sel = document.getElementById('stats-range-select');
+      const mode = sel.value;
+      if (mode === 'CUSTOM') {
+        statsState.rangeMode = 'CUSTOM';
+
+        // 切換成自訂起訖時，自動將目前已經顯示的範圍填入輸入框！
+        syncDateInputs();
+        const customBar = document.getElementById('stats-custom-range-bar');
+        if (customBar) customBar.style.display = 'flex';
+        renderStatsPage();
+      } else {
+        applyPresetRange(mode, true);
+      }
+    }
+
+    /** 套用自訂起訖日期（以週日為準，且限制不可超過要來之週日） */
+    async function applyCustomDateRange() {
+      const sInputVal = document.getElementById('stats-custom-start').value;
+      const eInputVal = document.getElementById('stats-custom-end').value;
+      if (!sInputVal || !eInputVal) {
+        showToast('請選擇完整的開始與結束日期', 'error');
+        return;
+      }
+
+      // 轉換成各自所屬週的週日
+      const sSun = getSunday(sInputVal);
+      let eSun = getSunday(eInputVal);
+      const maxSun = getSunday(new Date());
+      if (eSun > maxSun) {
+        eSun = maxSun;
+        showToast(`結束日期不可超過要來之週日（${formatDate(maxSun)}），已自動校準`, 'warning');
+      }
+
+      if (sSun > eSun) {
+        showToast('開始日期不能晚於結束日期', 'error');
+        return;
+      }
+
+      statsState.rangeMode = 'CUSTOM';
+      statsState.startDate = formatDate(sSun);
+      statsState.endDate = formatDate(eSun);
+      syncDateInputs();
+      const sel = document.getElementById('stats-range-select');
+      if (sel) sel.value = 'CUSTOM';
+
+      // 若自訂起訖超出當前快取，自動補抓歷史
+      if (attendanceStore.minLoadedWeek && attendanceStore.minLoadedWeek !== '0000-00-00' && attendanceStore.minLoadedWeek !== '__ALL__' && statsState.startDate < attendanceStore.minLoadedWeek) {
+        await ensureAttendanceRange(statsState.startDate);
+      }
+
+      renderStatsPage();
+    }
+
+    /** 平移時間軸窗口 (週數 delta: -5 為往前推移5週，+5 為往後推移5週) */
+    async function shiftStatsWindow(weekDelta) {
+      if (!statsState.startDate || !statsState.endDate) {
+        await applyPresetRange('W10', false);
+      }
+
+      const shifted = Timeline.shift(statsState.startDate, statsState.endDate, weekDelta);
+      statsState.startDate = shifted.startDate;
+      statsState.endDate = shifted.endDate;
+
+      // 若平移後超出快取，自動補抓歷史
+      if (attendanceStore.minLoadedWeek && attendanceStore.minLoadedWeek !== '0000-00-00' && attendanceStore.minLoadedWeek !== '__ALL__' && statsState.startDate < attendanceStore.minLoadedWeek) {
+        await ensureAttendanceRange(statsState.startDate);
+      }
+
+      // 自動同步到自訂日期輸入框
+      syncDateInputs();
+      renderStatsPage();
+    }
+
+    /** 重置時間軸窗口回到最新一週（預設 10 週） */
+    function resetStatsWindowToLatest() {
+      const sel = document.getElementById('stats-range-select');
+      if (sel) sel.value = 'W10';
+      applyPresetRange('W10', true);
+    }
+
+    /** 切換校園下拉選單 */
+    function handleStatsCampusChange() {
+      const sel = document.getElementById('stats-campus-select');
+      if (sel) {
+        statsState.selectedCampusId = sel.value;
+        sel.blur();
+      }
+      renderStatsPage();
+    }
+
+    /** 下鑽特定校園 */
+    function drilldownCampus(campusId) {
+      statsState.selectedCampusId = campusId;
+      const sel = document.getElementById('stats-campus-select');
+      if (sel) sel.value = campusId;
+      renderStatsPage();
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
+    /** 切換指標顯示狀態 */
+    function toggleStatsMetric(metricKey) {
+      statsState.activeMetrics[metricKey] = !statsState.activeMetrics[metricKey];
+      const chip = document.getElementById(`chip-metric-${metricKey}`);
+      if (chip) {
+        chip.classList.toggle('active', statsState.activeMetrics[metricKey]);
+        if (metricKey === 'pray' || metricKey === 'outreach') {
+          const prefix = statsState.activeMetrics[metricKey] ? '● ' : '＋ ';
+          chip.querySelector('span').textContent = prefix + (metricKey === 'pray' ? '禱告' : '出訪');
+        }
+        chip.blur();
+      }
+
+      renderStatsPage();
+    }
+
+    /** 切換「排除暫停週」開關 */
+    function toggleExcludeSuspendedWeeks() {
+      const checkbox = document.getElementById('stats-exclude-suspended');
+      if (checkbox) {
+        statsState.excludeSuspended = !!checkbox.checked;
+        checkbox.blur();
+        renderStatsPage();
+      }
+    }
+
+    /**
+     * 底層核心：純粹依據 [startDate, endDate]（週日）動態推算所有相關週次
+     */
+    function computeTargetWeeksList() {
+      if (!statsState.startDate || !statsState.endDate) {
+        applyPresetRange('W10', false);
+      }
+      return Timeline.buildWeekList(statsState.startDate, statsState.endDate);
+    }
+
+    /** 依領域報告渲染各校走勢圖表 */
+    function renderStatsTrendChart(report) {
+      const canvas = document.getElementById('stats-trend-canvas');
+      if (!canvas) return;
+
+      const datasets = [];
+      if (statsState.activeMetrics.attend) {
+        datasets.push({
+          label: '出席總數',
+          data: report.series.attend,
+          borderColor: '#0d9488',
+          backgroundColor: 'rgba(13, 148, 136, 0.08)',
+          borderWidth: 2.5,
+          pointBackgroundColor: '#0d9488',
+          pointRadius: 4,
+          pointHoverRadius: 6,
+          fill: true,
+          tension: 0.3
+        });
+      }
+
+      if (statsState.activeMetrics.gospel) {
+        datasets.push({
+          label: '福音朋友',
+          data: report.series.gospel,
+          borderColor: '#f97316',
+          backgroundColor: 'rgba(249, 115, 22, 0.08)',
+          borderWidth: 2.5,
+          pointBackgroundColor: '#f97316',
+          pointRadius: 4,
+          pointHoverRadius: 6,
+          fill: true,
+          tension: 0.3
+        });
+      }
+
+      if (statsState.activeMetrics.pray) {
+        datasets.push({
+          label: '禱告',
+          data: report.series.pray,
+          borderColor: '#6366f1',
+          backgroundColor: 'rgba(99, 102, 241, 0.05)',
+          borderWidth: 2,
+          borderDash: [4, 4],
+          pointBackgroundColor: '#6366f1',
+          pointRadius: 3,
+          fill: false,
+          tension: 0.3
+        });
+      }
+
+      if (statsState.activeMetrics.outreach) {
+        datasets.push({
+          label: '出訪',
+          data: report.series.outreach,
+          borderColor: '#ec4899',
+          backgroundColor: 'rgba(236, 72, 153, 0.05)',
+          borderWidth: 2,
+          borderDash: [3, 3],
+          pointBackgroundColor: '#ec4899',
+          pointRadius: 3,
+          fill: false,
+          tension: 0.3
+        });
+      }
+
+      const activeCampuses = state.campuses || [];
+      const chartTitle = statsState.selectedCampusId === 'ALL'
+        ? '🌟 全體小排出席與參與走勢'
+        : `🏫 ${(activeCampuses.find(c => c.id === statsState.selectedCampusId) || {}).name || ''} 數據走勢`;
+      const titleEl = document.getElementById('stats-chart-title');
+      if (titleEl) {
+        titleEl.innerHTML = `${chartTitle} <span style="font-size:0.82rem; font-weight:normal; color:var(--gray-500);">(不算服事者/家長)</span>`;
+      }
+      if (statsState.chartInstance) {
+        statsState.chartInstance.destroy();
+      }
+
+      if (typeof Chart !== 'undefined') {
+        statsState.chartInstance = new Chart(canvas, {
+          type: 'line',
+          data: { labels: report.series.labels, datasets },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            devicePixelRatio: Math.max(window.devicePixelRatio || 1, 2),
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+              legend: {
+                display: false
+              },
+              tooltip: {
+                padding: 10,
+                backgroundColor: 'rgba(15, 23, 42, 0.92)',
+                titleColor: '#ffffff',
+                bodyColor: '#f8fafc',
+                titleFont: {
+                  family: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang TC", "Microsoft JhengHei", sans-serif',
+                  size: 13,
+                  weight: '700'
+                },
+                bodyFont: {
+                  family: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang TC", "Microsoft JhengHei", sans-serif',
+                  size: 12
+                }
+              }
+            },
+            scales: {
+              y: {
+                beginAtZero: true,
+                ticks: {
+                  precision: 0,
+                  color: '#64748b',
+                  font: {
+                    family: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang TC", "Microsoft JhengHei", sans-serif',
+                    size: 11,
+                    weight: '500'
+                  }
+                },
+                grid: { color: '#f1f5f9' }
+              },
+              x: {
+                grid: { display: false },
+                ticks: {
+                  maxRotation: 45,
+                  color: '#64748b',
+                  font: {
+                    family: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang TC", "Microsoft JhengHei", sans-serif',
+                    size: 11,
+                    weight: '600'
+                  }
+                }
+              }
+            }
+          }
+        });
+      }
+    }
+
+    /** 依領域報告渲染各校明細排行表格（支援點擊排序） */
+    function renderStatsCampusTable(report) {
+      const targetReport = report || statsState.lastReport;
+      if (!targetReport || !targetReport.campusRankings) return;
+
+      const tbody = document.getElementById('stats-campus-tbody');
+      if (!tbody) return;
+
+      const sortedRankings = StatsAggregator.sortRankings(
+        targetReport.campusRankings,
+        statsState.tableSort.column,
+        statsState.tableSort.direction
+      );
+
+      tbody.innerHTML = sortedRankings.map(r => {
+        let trendBadge = '<span class="kpi-trend-flat">― 持平</span>';
+        if (r.trendStatus === 'THIS_WEEK_SUSPENDED') {
+          trendBadge = '<span class="kpi-trend-suspended">本週暫停</span>';
+        } else if (r.trendStatus === 'PREV_WEEK_SUSPENDED') {
+          trendBadge = '<span class="kpi-trend-suspended">上週暫停</span>';
+        } else if (r.trendStatus === 'UP') {
+          trendBadge = `<span class="kpi-trend-up">▲ +${r.diff}</span>`;
+        } else if (r.trendStatus === 'DOWN') {
+          trendBadge = `<span class="kpi-trend-down">▼ ${r.diff}</span>`;
+        }
+
+        const catClass = (r.category === '高中' ? 'hs' : (r.category === '國中' ? 'jh' : (r.category === '社區排' ? 'comm' : '')));
+        return `
+          <tr onclick="drilldownCampus('${r.id}')" title="點擊查看 ${r.name} 的詳細走勢">
+            <td>
+              <div class="table-campus-cell">
+                <span>${r.name}</span>
+                ${r.category ? `<span class="category-badge ${catClass}">${r.category}</span>` : ''}
+              </div>
+            </td>
+            <td style="text-align:right; font-weight:700;">${r.latestAttend} 人</td>
+            <td style="text-align:right; font-weight:700; color:#0d9488;">${r.avgAttend} 人</td>
+            <td style="text-align:right; color:#f97316; font-weight:600;">${r.gospelTotal} 人次</td>
+            <td style="text-align:center;">${trendBadge}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    /** 處理各小排統計表格點擊排序（點一下降序，再點升序） */
+    function handleStatsTableSort(col) {
+      if (statsState.tableSort.column === col) {
+        // 同一欄位：切換方向 (desc <-> asc)
+        statsState.tableSort.direction = (statsState.tableSort.direction === 'desc') ? 'asc' : 'desc';
+      } else {
+        // 新欄位：預設由大到小 (desc)
+        statsState.tableSort.column = col;
+        statsState.tableSort.direction = 'desc';
+      }
+
+      updateStatsTableSortIndicators();
+      renderStatsCampusTable();
+    }
+
+    /** 更新表格標題排序箭頭指示器 (▼: 降序, ▲: 升序) */
+    function updateStatsTableSortIndicators() {
+      const columns = ['name', 'latestAttend', 'avgAttend', 'gospelTotal', 'trend'];
+      const arrow = (statsState.tableSort.direction === 'desc') ? '▼' : '▲';
+
+      columns.forEach(col => {
+        const indEl = document.getElementById('sort-ind-' + col);
+        const thEl = indEl ? indEl.closest('th') : null;
+        if (indEl) {
+          if (col === statsState.tableSort.column) {
+            indEl.textContent = arrow;
+            if (thEl) thEl.classList.add('active-sort');
+          } else {
+            indEl.textContent = '';
+            if (thEl) thEl.classList.remove('active-sort');
+          }
+        }
+      });
+    }
+
+    /** 計算統計數據並渲染圖表、KPI 與各校明細表 */
+    function renderStatsPage() {
+      // 確保校園下拉選單已填入
+      const campusSelect = document.getElementById('stats-campus-select');
+      if (campusSelect && campusSelect.options.length <= 1) {
+        const activeCampuses = state.campuses || [];
+        let html = '<option value="ALL">🌟 全體小排匯總</option>';
+        activeCampuses.forEach(c => {
+          html += `<option value="${c.id}">${c.name} (${c.category || '一般'})</option>`;
+        });
+
+        campusSelect.innerHTML = html;
+        campusSelect.value = statsState.selectedCampusId;
+      }
+
+      // 1. 調用深模組 StatsAggregator 進行純量聚合計算
+      const report = StatsAggregator.aggregate({
+        attendanceByCampus: attendanceStore.attendanceByCampus || {},
+        campuses: state.campuses || [],
+        startDate: statsState.startDate,
+        endDate: statsState.endDate,
+        targetCampusId: statsState.selectedCampusId,
+        excludeSuspended: statsState.excludeSuspended
+      });
+      statsState.lastReport = report;
+
+      // 2. 更新時間軸區間標籤（以週日代表顯示）
+      const rangeLabelEl = document.getElementById('stats-window-range-label');
+      if (rangeLabelEl) {
+        if (report.window.weeks.length > 0) {
+          const firstW = report.window.weeks[0];
+          const lastW = report.window.weeks[report.window.weeks.length - 1];
+          rangeLabelEl.textContent = `${firstW.shortLabel} ～ ${lastW.shortLabel} ( 共 ${report.window.totalWeeks} 週 )`;
+        } else {
+          rangeLabelEl.textContent = '此區間無數據';
+        }
+      }
+
+      // 3. 更新【排除暫停週】Checkbox 狀態（全體時自動隱藏並停用）
+      const excludeWrap = document.getElementById('stats-exclude-suspended-wrap');
+      const excludeCheckbox = document.getElementById('stats-exclude-suspended');
+      if (excludeWrap && excludeCheckbox) {
+        if (statsState.selectedCampusId === 'ALL') {
+          excludeWrap.style.display = 'none';
+          excludeCheckbox.disabled = true;
+        } else {
+          excludeWrap.style.display = 'inline-flex';
+          excludeCheckbox.disabled = false;
+          excludeCheckbox.checked = !!statsState.excludeSuspended;
+        }
+      }
+
+      // 4. 更新 3 大 KPI 卡片（平均出席人數、平均福音朋友、活躍福音朋友）
+      // ① 平均出席人數
+      const kpiAvgAttendEl = document.getElementById('kpi-avg-attend');
+      const kpiAvgAttendSubEl = document.getElementById('kpi-avg-attend-sub');
+      if (kpiAvgAttendEl) kpiAvgAttendEl.textContent = `${report.kpis.attendance.formattedAvg} 人/週`;
+      if (kpiAvgAttendSubEl) {
+        const suspendNote = report.window.isExcludingSuspended && report.window.suspendedCount > 0
+          ? ` (已扣除 ${report.window.suspendedCount} 週暫停)`
+          : '';
+        kpiAvgAttendSubEl.textContent = `共 ${report.window.effectiveWeeksCount} 週${suspendNote} / 累計 ${report.kpis.attendance.total} 人`;
+      }
+
+      // ② 平均福音朋友
+      const kpiAvgGospelEl = document.getElementById('kpi-avg-gospel');
+      const kpiAvgGospelSubEl = document.getElementById('kpi-avg-gospel-sub');
+      if (kpiAvgGospelEl) kpiAvgGospelEl.textContent = `${report.kpis.gospel.formattedAvg} 人/週`;
+      if (kpiAvgGospelSubEl) {
+        const suspendNote = report.window.isExcludingSuspended && report.window.suspendedCount > 0
+          ? ` (已扣除 ${report.window.suspendedCount} 週暫停)`
+          : '';
+        kpiAvgGospelSubEl.textContent = `共 ${report.window.effectiveWeeksCount} 週${suspendNote} / 累計 ${report.kpis.gospel.total} 人`;
+      }
+
+      // ③ 活躍福音朋友
+      const kpiActiveGospelEl = document.getElementById('kpi-active-gospel');
+      const kpiActiveGospelSubEl = document.getElementById('kpi-active-gospel-sub');
+      if (kpiActiveGospelEl) kpiActiveGospelEl.textContent = `${report.kpis.activeGospel.count} 人`;
+      if (kpiActiveGospelSubEl) {
+        const gKpi = report.kpis.activeGospel;
+        kpiActiveGospelSubEl.innerHTML = `出席 > ${gKpi.formattedThreshold}次<br>(${gKpi.totalFriends}位中有${gKpi.count}位達標)`;
+      }
+
+      // 5. 渲染 Chart.js 趨勢曲線圖
+      renderStatsTrendChart(report);
+
+      // 6. 渲染各校數據明細表
+      updateStatsTableSortIndicators();
+      renderStatsCampusTable(report);
+    }
+
+// ===== 人員管理同步委派 (委派至 MemberStore 前端深模組) =====
+
+    /**
+     * 取得目前人員待同步變更筆數 (委派至 MemberStore)
+     * @returns {number}
+     */
+    function getMemberPendingCount() {
+      return (typeof memberStore !== 'undefined') ? memberStore.getPendingCount() : 0;
+    }
+
+    /**
+     * 排程人員變更同步 (委派至 MemberStore)
+     * @param {Object} change 變更內容 ({ type: 'add'|'modify'|'delete', name, ... })
+     * @param {Function} [rollbackFn] 失敗回退回調
+     * @param {boolean} [immediate=false] 是否立即同步
+     */
+    function scheduleMemberSync(change, rollbackFn, immediate = false) {
+      if (typeof memberStore !== 'undefined') {
+        memberStore.scheduleMemberSync(state.currentCampusId, change, rollbackFn, immediate);
+      }
+    }
+
+    /**
+     * 立即將隊列中的人員變更送至後端儲存 (委派至 MemberStore)
+     * @returns {Promise<void>}
+     */
+    function flushMemberSync() {
+      if (typeof memberStore !== 'undefined') {
+        return memberStore.flushMemberSync();
+      }
+    }
+
+    /**
+     * 合併伺服器最新人員清單與前端隊列變更 (委派至 MemberStore)
+     * @param {Array} serverMembers 伺服器回傳名單
+     * @param {Array} [pendingQueue] 待同步隊列
+     * @param {string} [campusId] 校園 ID
+     * @returns {Array} 合併後名單
+     */
+    function mergeServerMembersWithPendingQueue(serverMembers, pendingQueue, campusId) {
+      if (typeof memberStore !== 'undefined') {
+        return memberStore.mergeServerMembersWithPendingQueue(serverMembers, pendingQueue, campusId);
+      }
+      return serverMembers || [];
+    }
+
+    /** 返回首頁（自動落盤背景隊列） */
+    function goHome() {
+      if (attendanceStore.getPendingCount() > 0) attendanceStore.flush();
+      if (typeof memberStore !== 'undefined' && memberStore.getPendingCount() > 0) memberStore.flush();
+      doGoHome();
+    }
+
+    /** 執行實際返回首頁導覽流程 */
+    function doGoHome() {
+      state.currentCampusId = null;
+      state.currentCampus = null;
+      state.memberEditMode = false;
+      state.nameChanges = [];
+      state.helpPanelOpen = false;
+      const helpPopup = document.getElementById('help-popup');
+      const helpBtn = document.getElementById('btn-help');
+      if (helpPopup) helpPopup.classList.remove('open');
+      if (helpBtn) helpBtn.classList.remove('active');
+      updateEditMemberBtn();
+      resetFilter();
+
+      // 重置校園編輯模式
+      if (state.campusEditMode) {
+        state.campusEditMode = false;
+        updateCampusFooterUI();
+      }
+
+      const mainHeader = document.getElementById('main-view-header');
+      if (mainHeader) mainHeader.style.display = 'block';
+      document.getElementById('page-attendance').style.display = 'none';
+      switchMainTab('home');
+      renderCampuses();
+
+      if (attendanceStore.hasChanged()) {
+        attendanceStore.resetChanged();
+      }
+    }
+
+    /** 重新整理資料（右上角 🔄 按鈕呼叫，全量同步雲端） */
+    async function loadCampusDataFull() {
+      if (getPendingSaveCount() > 0) {
+        showToast('請等待背景儲存完成後再重新整理', 'error');
+        return;
+      }
+
+      await loadInitialDataFromCloud(true);
+    }
+
+    // 身分 → CSS class 對照表
+    const ROLE_CLASS_MAP = {
+      '弟兄':     'role-brother',
+      '姊妹':     'role-sister',
+      '男界朋友': 'role-mbro',
+      '女界朋友': 'role-msis',
+      '服事者/家長': 'role-server'
+    };
+
+    /** 渲染人員名單（使用 DocumentFragment 批次組裝，避免 DOM 重繪） */
+    function renderMembers() {
+      const container = document.getElementById('member-list');
+
+      // 依關鍵字（優先，忽略空白）或身分篩選
+      const q = state.searchQuery || '';
+      const filtered = q !== ''
+        ? state.members.filter(m => (m.name || '').replace(/\s+/g, '').includes(q))
+        : (state.roleFilter === '全部'
+            ? state.members
+            : state.members.filter(m => m.role === state.roleFilter));
+      if (state.members.length === 0) {
+        container.innerHTML = `
+          <div class="empty-state" style="grid-column: 1/-1;">
+            <div class="icon">👥</div>
+            <p>尚無人員，點擊右下角編輯後新增</p>
+          </div>`;
+        return;
+      }
+
+      if (filtered.length === 0) {
+        container.innerHTML = `
+          <div class="empty-state" style="grid-column: 1/-1;">
+            <div class="icon">🔍</div>
+            <p></p>
+          </div>`;
+        container.querySelector('p').textContent = q !== ''
+          ? `找不到符合「${q}」的人員`
+          : `目前篩選「${state.roleFilter}」無人員`;
+        return;
+      }
+
+      const fragment = document.createDocumentFragment();
+      filtered.forEach(member => {
+        const isPresent = state.memberEditMode
+          ? (member.defaults || []).includes('出席')
+          : attendanceStore.isMarked(member.name, '出席');
+        const isPraying = state.memberEditMode
+          ? (member.defaults || []).includes('禱告')
+          : attendanceStore.isMarked(member.name, '禱告');
+        const isGospel  = state.memberEditMode
+          ? (member.defaults || []).includes('傳福音')
+          : attendanceStore.isMarked(member.name, '傳福音');
+        const roleClass = ROLE_CLASS_MAP[member.role] || '';
+        const card = document.createElement('div');
+        card.className = 'member-card'
+          + (roleClass ? ' ' + roleClass : '')
+          + (isPresent ? ' present' : '')
+          + (state.memberEditMode ? ' edit-mode' : '');
+        card.dataset.name = member.name;
+
+        // 姓名
+        const nameEl = document.createElement('div');
+        nameEl.className = 'member-name';
+        nameEl.textContent = member.name;
+        card.appendChild(nameEl);
+
+        // 標籤資訊（社區排顯示於姓名下方：[原屬校園 · 學段]；校園排中若學段不同於該校則顯示於卡片右上角）
+        const currentCampus = state.campuses.find(c => c.id === state.currentCampusId) ||
+                              (state.archivedCampuses && state.archivedCampuses.find(c => c.id === state.currentCampusId));
+        const isComm = CampusDomain.isCommunity(currentCampus);
+
+        if (isComm) {
+          let campusName = '';
+          if (member.otherGroupId) {
+            const linkedCampus = state.campuses.find(c => c.id === member.otherGroupId) ||
+                                 (state.archivedCampuses && state.archivedCampuses.find(c => c.id === member.otherGroupId));
+            if (linkedCampus) campusName = linkedCampus.name;
+          }
+          let metaText = '';
+          if (campusName) {
+            metaText = `${campusName} · ${member.stage || '高中'}`;
+          } else if (member.stage) {
+            metaText = member.stage;
+          }
+          if (metaText) {
+            const metaEl = document.createElement('div');
+            metaEl.className = 'member-meta-tag';
+            metaEl.textContent = metaText;
+            card.appendChild(metaEl);
+          }
+        } else {
+          // 校園排：若學段與該校分類不同，顯示在成員卡片右上角（如高中排內的國中生）
+          if (member.stage && currentCampus && currentCampus.category && member.stage !== currentCampus.category) {
+            const stageBadge = document.createElement('span');
+            const stageClass = member.stage === '高中' ? ' hs' : '';
+            stageBadge.className = 'member-stage-badge' + stageClass;
+            stageBadge.textContent = member.stage;
+            card.appendChild(stageBadge);
+          }
+        }
+        if (state.memberEditMode) {
+          // 編輯按鈕（左上）
+          const editBadge = document.createElement('span');
+          editBadge.className = 'edit-badge';
+          editBadge.textContent = '✏️';
+          editBadge.title = '修改姓名/身分';
+          card.appendChild(editBadge);
+
+          // 刪除按鈕（右上）
+          const deleteBadge = document.createElement('span');
+          deleteBadge.className = 'delete-badge';
+          deleteBadge.textContent = '✕';
+          deleteBadge.title = '刪除人員';
+          card.appendChild(deleteBadge);
+        }
+
+        // 三個動作按鈕（正常模式點名 / 編輯模式設定預設參與）
+        const actionsEl = document.createElement('div');
+        actionsEl.className = 'member-actions';
+        const btnDefs = [
+          { cls: 'attend', type: '出席',   label: '出席', on: isPresent },
+          { cls: 'pray',   type: '禱告',   label: '禱告', on: isPraying },
+          { cls: 'gospel', type: '傳福音', label: '出訪', on: isGospel  },
+        ];
+        btnDefs.forEach(def => {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'action-btn ' + def.cls + (def.on ? ' on' : '');
+          btn.title = state.memberEditMode ? `設定預設「${def.label}」` : def.label;
+          btn.dataset.type = def.type;
+          btn.textContent = def.label;
+          actionsEl.appendChild(btn);
+        });
+
+        card.appendChild(actionsEl);
+        fragment.appendChild(card);
+      });
+
+      if (container.replaceChildren) {
+        container.replaceChildren(fragment);
+      } else {
+        container.innerHTML = '';
+        container.appendChild(fragment);
+      }
+    }
+
+    /** 局部更新單一成員卡片的狀態，無需重新渲染整張列表 (0 毫秒極速 DOM 局部重繪) */
+    function updateMemberCard(name) {
+      const card = document.querySelector(`#member-list .member-card[data-name="${CSS.escape(name)}"]`);
+      if (!card) return;
+      const isPresent = attendanceStore.isMarked(name, '出席');
+      const isPraying = attendanceStore.isMarked(name, '禱告');
+      const isGospel  = attendanceStore.isMarked(name, '傳福音');
+      card.classList.toggle('present', isPresent);
+      const attendBtn = card.querySelector('.action-btn.attend');
+      if (attendBtn) attendBtn.classList.toggle('on', isPresent);
+      const prayBtn = card.querySelector('.action-btn.pray');
+      if (prayBtn) prayBtn.classList.toggle('on', isPraying);
+      const gospelBtn = card.querySelector('.action-btn.gospel');
+      if (gospelBtn) gospelBtn.classList.toggle('on', isGospel);
+    }
+
+    // ===== 點名操作與週次切換（由 AttendanceStore 驅動） =====
+
+    /** 點擊切換出席/禱告/傳福音 (0ms 樂觀更新 + 防抖聚合，由 AttendanceStore 驅動) */
+    function toggleRecord(name, type) {
+      if (isCurrentWeekSuspended()) return;
+      const member = state.members.find(m => m.name === name);
+      const res = attendanceStore.toggle(name, type, member ? member.role : '');
+      if (type === '出席' && member && res) {
+        if (res.isMarked) {
+          member.count = (member.count || 0) + 1;
+        } else {
+          member.count = Math.max(0, (member.count || 0) - 1);
+        }
+      }
+      updateMemberCard(name);
+      updateAttendanceCount();
+    }
+
+    /** 切換週次（快取內 0ms 極速；超出快取時由 AttendanceStore 自動預載歷史） */
+    async function changeWeek(delta) {
+      if (attendanceStore.getPendingCount() > 0) attendanceStore.flush();
+      state.weekOffset += delta;
+      document.getElementById('week-label').innerHTML = getWeekLabel();
+
+      await attendanceStore.setWeek(getCurrentWeekStr());
+      renderMembers();
+      updateAttendanceCount();
+    }
+
+    /** 新增人位（0ms 樂觀更新 + 防抖背景同步，由 MemberStore 驅動） */
+    function handleAddMember() {
+      const name = document.getElementById('input-member-name').value.trim();
+      if (!name) { showToast('請輸入姓名', 'error'); return; }
+
+      // 檢查同校是否重名
+      if (state.members.some(m => m.name === name)) {
+        showToast('此小排已存在相同姓名的人員', 'error');
+        return;
+      }
+
+      const selectedRoleBtn = document.querySelector('#role-selector .role-btn.selected');
+      if (!selectedRoleBtn) { showToast('請選擇身分', 'error'); return; }
+      const role = selectedRoleBtn.dataset.role;
+      const defaults = getSelectedDefaults('add-defaults-selector');
+
+      const currentCampus = state.campuses.find(c => c.id === state.currentCampusId) ||
+                            (state.archivedCampuses && state.archivedCampuses.find(c => c.id === state.currentCampusId));
+      const isComm = CampusDomain.isCommunity(currentCampus);
+
+      let otherGroupId = '';
+      if (isComm) {
+        const otherGroupIdEl = document.getElementById('add-member-other-campus');
+        otherGroupId = otherGroupIdEl ? otherGroupIdEl.value.trim() : '';
+      }
+      const stage = getSelectedStage('add');
+
+      const newMember = {
+        name: name,
+        count: 0,
+        role: role,
+        defaults: defaults,
+        otherGroupId: otherGroupId,
+        stage: stage || '其他'
+      };
+      state.members.push(newMember);
+      sortMemberList(state.members);
+
+      if (state.currentCampusId) {
+        state.membersByCampus[state.currentCampusId] = state.members;
+      }
+
+      closeModal('modal-add-member');
+      renderMembers();
+
+      const change = {
+        type: 'add',
+        name: name,
+        role: role,
+        stage: stage || '其他',
+        defaults: defaults,
+        otherGroupId: otherGroupId
+      };
+      const rollbackFn = () => {
+        const idx = state.members.findIndex(m => m.name === name);
+        if (idx !== -1) state.members.splice(idx, 1);
+        if (state.currentCampusId) {
+          state.membersByCampus[state.currentCampusId] = state.members;
+        }
+        if (typeof renderMembers === 'function') renderMembers();
+      };
+      scheduleMemberSync(change, rollbackFn);
+      showToast(`已新增「${name}」`, 'success');
+    }
+
+    /** 刪除人位（0ms 樂觀更新 + 防抖背景同步，由 MemberStore 驅動） */
+    function handleDeleteMember(name) {
+      const idx = state.members.findIndex(m => m.name === name);
+      if (idx === -1) return;
+      const deletedMember = state.members.splice(idx, 1)[0];
+      attendanceStore.removeMember(name);
+      if (state.currentCampusId) {
+        state.membersByCampus[state.currentCampusId] = state.members;
+      }
+
+      renderMembers();
+
+      const change = { type: 'delete', name: name };
+      const rollbackFn = () => {
+        state.members.push(deletedMember);
+        sortMemberList(state.members);
+        if (state.currentCampusId) {
+          state.membersByCampus[state.currentCampusId] = state.members;
+        }
+        if (typeof renderMembers === 'function') renderMembers();
+      };
+      scheduleMemberSync(change, rollbackFn);
+      showToast(`已刪除「${name}」`, 'success');
+    }
+
+    // ===== 編輯人位 =====
+
+    /** 開啟編輯人位 modal，並預填現有資料與預設參與值 */
+    function openEditMemberModal(member) {
+      document.getElementById('edit-member-oldname').value = member.name;
+      document.getElementById('edit-member-name').value    = member.name;
+
+      // 重置並預選身分
+      const btns = document.querySelectorAll('#edit-role-selector .role-btn');
+      btns.forEach(b => {
+        b.classList.remove('selected');
+        if (b.dataset.role === member.role) b.classList.add('selected');
+      });
+
+      // 判斷當前小排是否為社區排
+      const currentCampus = state.campuses.find(c => c.id === state.currentCampusId) ||
+                            (state.archivedCampuses && state.archivedCampuses.find(c => c.id === state.currentCampusId));
+      const isComm = CampusDomain.isCommunity(currentCampus);
+
+      const campusBox = document.getElementById('edit-campus-group-box');
+      if (campusBox) {
+        campusBox.style.display = isComm ? 'block' : 'none';
+        if (isComm) {
+          populateCampusOptions('edit-member-other-campus', member.otherGroupId || '');
+        }
+      }
+
+      // 學段預設
+      const defaultStage = CampusDomain.isSchool(currentCampus) ? CampusDomain.getCat(currentCampus) : '高中';
+      const initialStage = (!member.stage || (member.stage === '其他' && CampusDomain.isSchool(currentCampus)))
+        ? defaultStage : member.stage;
+      setStageSelector('edit-stage-selector', initialStage);
+
+      // 預選預設參與值
+      setSelectedDefaults('edit-defaults-selector', member.defaults || []);
+      openModal('modal-edit-member');
+    }
+
+    /** 身分切換（編輯 modal 用） */
+    function selectEditRole(btn) {
+      document.querySelectorAll('#edit-role-selector .role-btn').forEach(b => b.classList.remove('selected'));
+      btn.classList.add('selected');
+    }
+
+    /** 儲存人位編輯（0ms 樂觀更新 + 防抖背景同步，由 MemberStore 驅動） */
+    function handleEditMember() {
+      const oldName = document.getElementById('edit-member-oldname').value;
+      const newName = document.getElementById('edit-member-name').value.trim();
+      if (!newName) { showToast('請輸入姓名', 'error'); return; }
+
+      // 若改名，檢查新名稱是否重複
+      if (newName !== oldName && state.members.some(m => m.name === newName)) {
+        showToast('此小排已存在相同姓名的人員', 'error');
+        return;
+      }
+
+      const selectedRoleBtn = document.querySelector('#edit-role-selector .role-btn.selected');
+      if (!selectedRoleBtn) { showToast('請選擇身分', 'error'); return; }
+      const newRole = selectedRoleBtn.dataset.role;
+      const member = state.members.find(m => m.name === oldName);
+      if (!member) {
+        closeModal('modal-edit-member');
+        return;
+      }
+      const oldRole = member.role;
+
+      // 檢查是否發生實質變更（若無變更，避免無意義的儲存與網路請求）
+      const currentCampus = state.campuses.find(c => c.id === state.currentCampusId) ||
+                            (state.archivedCampuses && state.archivedCampuses.find(c => c.id === state.currentCampusId));
+      const isComm = CampusDomain.isCommunity(currentCampus);
+
+      const defaults = getSelectedDefaults('edit-defaults-selector');
+      const stage = getSelectedStage('edit');
+
+      let targetOtherGroupId = member.otherGroupId || '';
+      if (isComm) {
+        const otherGroupIdEl = document.getElementById('edit-member-other-campus');
+        targetOtherGroupId = otherGroupIdEl ? otherGroupIdEl.value.trim() : '';
+      } else {
+        const isRenamed = (newName !== oldName);
+        const isStageChanged = (stage && member.stage && member.stage !== stage);
+        if (isRenamed || isStageChanged) {
+          targetOtherGroupId = '';
+        }
+      }
+
+      const oldDefaults = Array.isArray(member.defaults) ? member.defaults : [];
+      const isDefaultsEqual = (oldDefaults.length === defaults.length) &&
+        defaults.every(d => oldDefaults.includes(d));
+
+      const hasChanged = (newName !== oldName) ||
+                         (newRole !== oldRole) ||
+                         ((stage || '其他') !== (member.stage || '其他')) ||
+                         !isDefaultsEqual ||
+                         (targetOtherGroupId !== (member.otherGroupId || ''));
+
+      if (!hasChanged) {
+        // 未發生任何變更：直接關閉彈窗，避免無意義儲存
+        closeModal('modal-edit-member');
+        return;
+      }
+
+      // 檢查非標準身分轉換 (降級或性別轉換)
+      const isDowngrade = ['弟兄', '姊妹', '服事者/家長'].includes(oldRole) && ['男界朋友', '女界朋友'].includes(newRole);
+      const isGenderChange = (['男界朋友', '弟兄'].includes(oldRole) && ['女界朋友', '姊妹'].includes(newRole)) ||
+                             (['女界朋友', '姊妹'].includes(oldRole) && ['男界朋友', '弟兄'].includes(newRole));
+      if (oldRole && oldRole !== newRole && (isDowngrade || isGenderChange)) {
+        let reason = '';
+        if (isDowngrade) reason = '受浸身分通常不可逆（弟兄/姊妹 ➔ 朋友）';
+        if (isGenderChange) reason = '性別通常不應轉換';
+        confirmAction(
+          '⚠️ 身分變更警告',
+          `您正將成員身分從「<b>${oldRole}</b>」變更為「<b>${newRole}</b>」<br><small style="color:var(--gray-500)">(${reason})</small><br><br>確定要繼續修改嗎？`,
+          '確定修改',
+          () => executeSaveMemberEdit(oldName, newName, newRole, defaults, stage, targetOtherGroupId)
+        );
+        return;
+      }
+
+      executeSaveMemberEdit(oldName, newName, newRole, defaults, stage, targetOtherGroupId);
+    }
+
+    /**
+     * 執行人員編輯儲存與同步排程（樂觀更新卡片、連動改名與註冊回退）
+     * @param {string} oldName 原姓名
+     * @param {string} newName 新姓名
+     * @param {string} newRole 新身分
+     * @param {Array<string>} [preDefaults] 預設參與清單
+     * @param {string} [preStage] 學段
+     * @param {string} [preOtherGroupId] 關聯小排 ID
+     */
+    function executeSaveMemberEdit(oldName, newName, newRole, preDefaults, preStage, preOtherGroupId) {
+      const currentCampus = state.campuses.find(c => c.id === state.currentCampusId) ||
+                            (state.archivedCampuses && state.archivedCampuses.find(c => c.id === state.currentCampusId));
+      const isComm = CampusDomain.isCommunity(currentCampus);
+
+      const defaults = preDefaults !== undefined ? preDefaults : getSelectedDefaults('edit-defaults-selector');
+      const stage = preStage !== undefined ? preStage : getSelectedStage('edit');
+
+      const member = state.members.find(m => m.name === oldName);
+      const oldMemberSnapshot = member ? {
+        name: oldName,
+        role: member.role,
+        stage: member.stage,
+        defaults: [...(member.defaults || [])],
+        otherGroupId: member.otherGroupId
+      } : null;
+
+      if (member) {
+        let otherGroupId = preOtherGroupId !== undefined ? preOtherGroupId : (member.otherGroupId || '');
+        if (preOtherGroupId === undefined) {
+          if (isComm) {
+            const otherGroupIdEl = document.getElementById('edit-member-other-campus');
+            otherGroupId = otherGroupIdEl ? otherGroupIdEl.value.trim() : '';
+          } else {
+            // 校園排：若改名或改學段，本地主動清空連結標籤 (Case 2)
+            const isRenamed = (newName !== oldName);
+            const isStageChanged = (stage && member.stage && member.stage !== stage);
+            if (isRenamed || isStageChanged) {
+              otherGroupId = '';
+            }
+          }
+        }
+
+        member.name = newName;
+        member.role = newRole;
+        member.defaults = defaults;
+        member.otherGroupId = otherGroupId;
+        if (stage) member.stage = stage;
+      }
+
+      if (newName !== oldName) {
+        attendanceStore.renameMember(oldName, newName);
+        sortMemberList(state.members);
+      }
+
+      if (state.currentCampusId) {
+        state.membersByCampus[state.currentCampusId] = state.members;
+      }
+
+      closeModal('modal-edit-member');
+      renderMembers();
+
+      const change = {
+        type: 'modify',
+        oldName: oldName,
+        name: newName,
+        role: newRole,
+        stage: stage || '',
+        defaults: defaults,
+        otherGroupId: member ? member.otherGroupId : ''
+      };
+      const rollbackFn = () => {
+        if (oldMemberSnapshot) {
+          const target = state.members.find(m => m.name === newName);
+          if (target) {
+            target.name = oldMemberSnapshot.name;
+            target.role = oldMemberSnapshot.role;
+            target.stage = oldMemberSnapshot.stage;
+            target.defaults = oldMemberSnapshot.defaults;
+            target.otherGroupId = oldMemberSnapshot.otherGroupId;
+          }
+          if (newName !== oldName) {
+            attendanceStore.renameMember(newName, oldName);
+            sortMemberList(state.members);
+          }
+          if (state.currentCampusId) {
+            state.membersByCampus[state.currentCampusId] = state.members;
+          }
+          if (typeof renderMembers === 'function') renderMembers();
+        }
+      };
+      scheduleMemberSync(change, rollbackFn);
+      showToast(`已修改「${newName}」`, 'success');
+    }
+
+    /** 從編輯 modal 觸發刪除（先關 modal，再走確認流程） */
+    function handleDeleteFromEdit() {
+      const name = document.getElementById('edit-member-oldname').value;
+      const currentSavedY = savedBodyScrollY;
+      closeModal('modal-edit-member');
+      confirmDelete('人位', name, () => handleDeleteMember(name));
+      savedBodyScrollY = currentSavedY;
+    }
+
+    /** 在編輯模式下本地切換成員的預設參與值（0ms 即時反饋） */
+    function toggleMemberDefaultLocal(member, type) {
+      if (!Array.isArray(member.defaults)) member.defaults = [];
+      const idx = member.defaults.indexOf(type);
+      const wasPresent = (idx !== -1);
+      if (idx !== -1) {
+        member.defaults.splice(idx, 1);
+      } else {
+        member.defaults.push(type);
+      }
+
+      if (state.currentCampusId) {
+        state.membersByCampus[state.currentCampusId] = state.members;
+      }
+
+      const defaultChange = {
+        type: 'modify',
+        oldName: member.name,
+        name: member.name,
+        role: member.role,
+        stage: member.stage || '',
+        defaults: [...member.defaults],
+        otherGroupId: member.otherGroupId || ''
+      };
+      const rollbackDefaultFn = () => {
+        const target = state.members.find(m => m.name === member.name);
+        if (target) {
+          if (wasPresent) {
+            if (!target.defaults.includes(type)) target.defaults.push(type);
+          } else {
+            const i = target.defaults.indexOf(type);
+            if (i !== -1) target.defaults.splice(i, 1);
+          }
+          if (state.currentCampusId) {
+            state.membersByCampus[state.currentCampusId] = state.members;
+          }
+        }
+      };
+      scheduleMemberSync(defaultChange, rollbackDefaultFn);
+
+      // 局部更新該卡片上的按鈕狀態與卡片背景亮起狀態
+      const card = document.querySelector(`#member-list .member-card[data-name="${CSS.escape(member.name)}"]`);
+      if (card) {
+        const isPresent = member.defaults.includes('出席');
+        card.classList.toggle('present', isPresent);
+        const btn = card.querySelector(`.action-btn[data-type="${type}"]`);
+        if (btn) {
+          btn.classList.toggle('on', member.defaults.includes(type));
+        }
+      }
+    }
+
+    /** 切換人員編輯模式（進入編輯 / 完成退出） */
+    function toggleMemberEditMode() {
+      closeHelpPanel();
+      state.memberEditMode = !state.memberEditMode;
+      if (!state.memberEditMode && typeof flushMemberSync === 'function') {
+        flushMemberSync();
+      }
+      updateEditMemberBtn();
+      renderMembers();
+    }
+
+    /** 更新編輯按鈕與底部提示狀態 */
+    function updateEditMemberBtn() {
+      const btn = document.getElementById('btn-edit-members');
+      const fabAdd = document.getElementById('fab-add-member');
+      const fabApply = document.getElementById('btn-apply-defaults');
+      const fabHint = document.getElementById('fab-edit-hint');
+      if (state.memberEditMode) {
+        btn.textContent = '✅';
+        btn.title = '完成編輯';
+        btn.classList.add('editing');
+        if (fabAdd) fabAdd.classList.add('visible');
+        if (fabApply) fabApply.style.display = 'none';
+        if (fabHint) fabHint.style.display = 'flex';
+      } else {
+        btn.textContent = '✏️';
+        btn.title = '編輯人員';
+        btn.classList.remove('editing');
+        btn.blur();
+        if (fabAdd) fabAdd.classList.remove('visible');
+        if (fabApply) fabApply.style.display = 'flex';
+        if (fabHint) fabHint.style.display = 'none';
+      }
+
+      updateHelpContent();
+      updateSuspensionUI();
+    }
+
+    // ===== 一鍵套用預設參與名單 =====
+
+    /** 點擊「⚡ 套用預設」按鈕 */
+    function handleApplyDefaultsClick() {
+      if (isCurrentWeekSuspended()) {
+        showToast('本週小排已暫停，無法套用預設名單', 'error');
+        return;
+      }
+
+      if (getPendingSaveCount() > 0) {
+        showToast('請等待背景儲存完成後再套用預設', 'error');
+        return;
+      }
+
+      // 檢查當前週次是否已有點名紀錄
+      const counts = attendanceStore.getWeekCounts();
+      const hasRecords = counts.attend > 0 || counts.pray > 0 || counts.gospel > 0;
+      if (!hasRecords) {
+        // 當週全空，直接套用
+        applyDefaultsConfirmed();
+      } else {
+        // 當週已有紀錄，提示覆蓋確認
+        confirmAction(
+          '確認覆蓋點名紀錄',
+          '本週已有部分點名紀錄，確定要<span class="confirm-highlight">覆蓋現有紀錄</span>並套用預設參與名單嗎？<br><small style="color:var(--gray-500)">現有紀錄將被預設名單取代。</small>',
+          '覆蓋套用',
+          applyDefaultsConfirmed
+        );
+      }
+    }
+
+    /** 執行套用預設參與名單 */
+    async function applyDefaultsConfirmed() {
+      const weekStr = getCurrentWeekStr();
+      const campusId = state.currentCampusId;
+
+      // 整理要套用的新紀錄清單
+      const newRecords = [];
+      state.members.forEach(member => {
+        if (Array.isArray(member.defaults)) {
+          member.defaults.forEach(type => {
+            if (['出席', '禱告', '傳福音'].includes(type)) {
+              newRecords.push({ name: member.name, type: type, role: member.role || '' });
+            }
+          });
+        }
+      });
+
+      // ① 立即樂觀更新前端快取與 UI (0ms 即時反饋)
+      const savePromise = attendanceStore.applyDefaults(newRecords);
+      renderMembers();
+      updateAttendanceCount();
+      showToast('已套用預設名單', 'success');
+
+      // ② 背景等待後端批次寫回
+      showLoading();
+      try {
+        await savePromise;
+      } catch (e) {
+        showToast('套用失敗：' + e.message, 'error');
+        await loadCampusDataFull();
+      } finally {
+        hideLoading();
+      }
+    }
+
+// ===== 篩選與說明功能 =====
+
+    /** 更新說明面板內容（點名模式 vs 編輯模式） */
+    function updateHelpContent() {
+      const title = document.getElementById('help-title');
+      const attSection = document.getElementById('help-mode-attendance');
+      const editSection = document.getElementById('help-mode-edit');
+      if (!title || !attSection || !editSection) return;
+      if (state.memberEditMode) {
+        title.textContent = '⚙️ 編輯模式操作說明';
+        attSection.style.display = 'none';
+        editSection.style.display = 'block';
+      } else {
+        title.textContent = '💡 點名與功能說明';
+        attSection.style.display = 'block';
+        editSection.style.display = 'none';
+      }
+    }
+
+    /** 關閉說明面板 */
+    function closeHelpPanel() {
+      state.helpPanelOpen = false;
+      const helpPopup = document.getElementById('help-popup');
+      const helpBtn = document.getElementById('btn-help');
+      if (helpPopup) helpPopup.classList.remove('open');
+      if (helpBtn) {
+        helpBtn.classList.remove('active');
+        helpBtn.blur();
+      }
+    }
+    /** 開啟篩選面板（原地切換為搜尋框，不強制 focus 避免強彈手機鍵盤） */
+    function toggleFilterPanel() {
+      state.filterPanelOpen = true;
+      const chips = document.getElementById('filter-chips');
+      const filterBtn = document.getElementById('filter-toggle-btn');
+      const searchWrap = document.getElementById('filter-search-wrap');
+      if (chips) chips.classList.add('open');
+      if (filterBtn) filterBtn.style.display = 'none';
+      if (searchWrap) {
+        searchWrap.style.display = 'flex';
+        searchWrap.classList.add('panel-open');
+      }
+
+      // 若打開篩選，自動收合說明
+      if (state.helpPanelOpen) {
+        closeHelpPanel();
+      }
+    }
+
+    /** 收合篩選面板（若搜尋框有文字則保留搜尋框，若空白則恢復為膠囊按鈕） */
+    function closeFilterPanel() {
+      state.filterPanelOpen = false;
+      const chips = document.getElementById('filter-chips');
+      const filterBtn = document.getElementById('filter-toggle-btn');
+      const searchWrap = document.getElementById('filter-search-wrap');
+      const searchInput = document.getElementById('filter-search-input');
+      if (chips) chips.classList.remove('open');
+      if (searchWrap) searchWrap.classList.remove('panel-open');
+      if (searchInput) searchInput.blur();
+
+      if (state.searchQuery) {
+        if (searchWrap) {
+          searchWrap.style.display = 'flex';
+          searchWrap.classList.add('active-search');
+        }
+        if (filterBtn) filterBtn.style.display = 'none';
+      } else {
+        if (searchInput) searchInput.value = '';
+        if (searchWrap) {
+          searchWrap.style.display = 'none';
+          searchWrap.classList.remove('active-search');
+        }
+        if (filterBtn) {
+          filterBtn.style.display = '';
+          filterBtn.classList.remove('panel-open');
+          filterBtn.blur();
+        }
+      }
+    }
+
+    /** 點擊搜尋框時（若面板已收合則重新展開，並聚焦輸入框） */
+    function handleFilterSearchClick() {
+      if (!state.filterPanelOpen) {
+        toggleFilterPanel();
+      }
+      const searchInput = document.getElementById('filter-search-input');
+      if (searchInput && document.activeElement !== searchInput) {
+        searchInput.focus();
+      }
+    }
+
+    /** 即時搜尋姓名輸入處理（自動忽略空白，即時更新人員列表） */
+    function handleFilterSearchInput(rawVal) {
+      const q = (rawVal || '').replace(/\s+/g, '');
+      state.searchQuery = q;
+
+      const clearBtn = document.getElementById('filter-search-clear');
+      const searchWrap = document.getElementById('filter-search-wrap');
+      const toggleBtn = document.getElementById('filter-toggle-btn');
+      if (clearBtn) clearBtn.style.display = q ? 'inline-flex' : 'none';
+      if (searchWrap) searchWrap.classList.toggle('active-search', q !== '');
+
+      // 輸入有效關鍵字時搜尋全體人員，重置身分篩選為「全部」
+      document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('selected'));
+      if (q) {
+        state.roleFilter = '全部';
+        if (toggleBtn) {
+          toggleBtn.textContent = '🔍 篩選';
+          toggleBtn.classList.remove('active-filter');
+        }
+      } else {
+        const activeChip = document.querySelector(`.filter-chip[data-role="${state.roleFilter}"]`);
+        if (activeChip) activeChip.classList.add('selected');
+      }
+
+      renderMembers();
+    }
+
+    /** 點擊搜尋框右側 ✕ 清除按鈕 */
+    function clearFilterSearch(e) {
+      if (e) e.stopPropagation();
+      const searchInput = document.getElementById('filter-search-input');
+      if (searchInput) searchInput.value = '';
+      handleFilterSearchInput('');
+      if (state.filterPanelOpen) {
+        if (searchInput) searchInput.focus();
+      } else {
+        closeFilterPanel();
+      }
+    }
+
+    /** 切換說明面板開關 */
+    function toggleHelpPanel() {
+      state.helpPanelOpen = !state.helpPanelOpen;
+      updateHelpContent();
+      const helpPopup = document.getElementById('help-popup');
+      const helpBtn = document.getElementById('btn-help');
+      if (helpPopup) helpPopup.classList.toggle('open', state.helpPanelOpen);
+      if (helpBtn) {
+        helpBtn.classList.toggle('active', state.helpPanelOpen);
+        if (!state.helpPanelOpen) helpBtn.blur();
+      }
+
+      // 若打開說明，自動收合篩選面板
+      if (state.helpPanelOpen && state.filterPanelOpen) {
+        closeFilterPanel();
+      }
+    }
+
+    /** 設定身分篩選（自動清空搜尋框並切換至指定身分） */
+    function setRoleFilter(role, chipEl) {
+      state.roleFilter = role;
+      state.searchQuery = '';
+
+      const searchInput = document.getElementById('filter-search-input');
+      const clearBtn = document.getElementById('filter-search-clear');
+      if (searchInput) searchInput.value = '';
+      if (clearBtn) clearBtn.style.display = 'none';
+
+      // 更新 chip 選中狀態
+      document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('selected'));
+      chipEl.classList.add('selected');
+
+      // 篩選按鈕顯示狀態
+      const toggleBtn = document.getElementById('filter-toggle-btn');
+      if (role === '全部') {
+        toggleBtn.textContent = '🔍 篩選';
+        toggleBtn.classList.remove('active-filter');
+      } else {
+        toggleBtn.textContent = `🔍 ${role}`;
+        toggleBtn.classList.add('active-filter');
+      }
+
+      // 關閉面板並重新渲染
+      closeFilterPanel();
+      renderMembers();
+    }
+
+    /** 進入校園或返回首頁時重置篩選、搜尋與說明狀態 */
+    function resetFilter() {
+      state.roleFilter = '全部';
+      state.searchQuery = '';
+      state.filterPanelOpen = false;
+      state.helpPanelOpen = false;
+      const searchInput = document.getElementById('filter-search-input');
+      const clearBtn = document.getElementById('filter-search-clear');
+      if (searchInput) searchInput.value = '';
+      if (clearBtn) clearBtn.style.display = 'none';
+      const helpPopup = document.getElementById('help-popup');
+      const helpBtn = document.getElementById('btn-help');
+      if (helpPopup) helpPopup.classList.remove('open');
+      if (helpBtn) helpBtn.classList.remove('active');
+      document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('selected'));
+      const allChip = document.querySelector('.filter-chip[data-role="全部"]');
+      if (allChip) allChip.classList.add('selected');
+      const toggleBtn = document.getElementById('filter-toggle-btn');
+      if (toggleBtn) {
+        toggleBtn.textContent = '🔍 篩選';
+        toggleBtn.classList.remove('active-filter');
+      }
+      closeFilterPanel();
+    }
+
+    // ===== Member List 事件委派 =====
+    /**
+     * 初始化人員名單點擊事件委派（單一事件監聽器處理點名打卡、編輯成員與預設值切換）
+     */
+    function initMemberListDelegation() {
+      const container = document.getElementById('member-list');
+      if (!container) return;
+      container.addEventListener('click', (e) => {
+        const card = e.target.closest('.member-card');
+        if (!card) return;
+        const name = card.dataset.name;
+        if (!name) return;
+        if (state.memberEditMode) {
+          const member = state.members.find(m => m.name === name);
+          if (!member) return;
+          const deleteBadge = e.target.closest('.delete-badge');
+          if (deleteBadge) {
+            confirmDelete('人位', name, () => handleDeleteMember(name));
+            return;
+          }
+
+          const actionBtn = e.target.closest('.action-btn');
+          if (actionBtn) {
+            const type = actionBtn.dataset.type;
+            if (type) {
+              toggleMemberDefaultLocal(member, type);
+            }
+
+            return;
+          }
+
+          // 點擊 edit-badge 或卡片本體開啟編輯 modal（修改姓名與身分）
+          openEditMemberModal(member);
+        } else {
+          const actionBtn = e.target.closest('.action-btn');
+          if (actionBtn) {
+            const type = actionBtn.dataset.type;
+            if (type) {
+              toggleRecord(name, type);
+            }
+          }
+        }
+      });
+    }
+
+    // ===== 篩選與說明面板點擊外部關閉（使用捕獲階段以確保任何區域點擊皆能觸發） =====
+    document.addEventListener('click', (e) => {
+      if (state.filterPanelOpen) {
+        const filterBar = document.getElementById('filter-bar');
+        if (filterBar && !filterBar.contains(e.target)) {
+          closeFilterPanel();
+        }
+      }
+
+      if (state.helpPanelOpen) {
+        const fabGroup = document.getElementById('fab-group');
+        if (fabGroup && !fabGroup.contains(e.target)) {
+          state.helpPanelOpen = false;
+          const helpPopup = document.getElementById('help-popup');
+          const helpBtn = document.getElementById('btn-help');
+          if (helpPopup) helpPopup.classList.remove('open');
+          if (helpBtn) helpBtn.classList.remove('active');
+        }
+      }
+
+    }, true);
+
+    // ===== Modal 鍵盤支持 =====
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        if (document.getElementById('modal-add-campus').classList.contains('active')) {
+          handleAddCampus();
+        } else if (document.getElementById('modal-add-member').classList.contains('active')) {
+          handleAddMember();
+        } else if (document.getElementById('modal-edit-member').classList.contains('active')) {
+          handleEditMember();
+        } else if (document.getElementById('modal-rename-campus').classList.contains('active')) {
+          handleRenameCampus();
+        } else if (document.getElementById('modal-confirm').classList.contains('active')) {
+          handleConfirm();
+        }
+      }
+
+      if (e.key === 'Escape') {
+        document.querySelectorAll('.modal-backdrop.active').forEach(m => {
+          closeModal(m.id);
+        });
+      }
+    });
+
+    // 點擊 modal 背景關閉
+    // 重要防護：表單類對話框（新增小排、編輯小排、新增成員、編輯成員、刪除確認等）
+    // 禁止點擊背景空白關閉，必須點擊「取消」或對應按鈕，徹底杜絕誤觸與手機端偏移引發的悲劇！
+    const noBackdropCloseModals = new Set([
+      'modal-add-campus',
+      'modal-rename-campus',
+      'modal-add-member',
+      'modal-edit-member',
+      'modal-confirm'
+    ]);
+
+    document.querySelectorAll('.modal-backdrop').forEach(backdrop => {
+      let downTarget = null;
+      backdrop.addEventListener('pointerdown', (e) => {
+        downTarget = e.target;
+      });
+      backdrop.addEventListener('pointercancel', () => {
+        downTarget = null;
+      });
+
+      // 關鍵防護：當手指在背景遮罩（對話框外部）滑動時，完全阻止滾動手勢傳遞，徹底凍結背景畫面！
+      backdrop.addEventListener('touchmove', (e) => {
+        if (e.target === backdrop) {
+          e.preventDefault();
+        }
+      }, { passive: false });
+
+      backdrop.addEventListener('click', (e) => {
+        if (noBackdropCloseModals.has(backdrop.id)) {
+          downTarget = null;
+          return;
+        }
+        if (e.target === backdrop && downTarget === backdrop) {
+          closeModal(backdrop.id);
+        }
+        downTarget = null;
+      });
+    });
+
+    // ===== 初始化 =====
+    window.addEventListener('DOMContentLoaded', () => {
+      initCampusListDelegation();
+      initMemberListDelegation();
+      if (typeof SERVER_PRELOADED_DATA !== 'undefined' && SERVER_PRELOADED_DATA && SERVER_PRELOADED_DATA.campuses) {
+        // 伺服器端已預載：0 毫秒立即呈現首頁！
+        applyLoadedData(SERVER_PRELOADED_DATA);
+      } else {
+        // 備援：單次拉取雲端全域資料
+        loadInitialDataFromCloud(false);
+      }
+    });
+</script>

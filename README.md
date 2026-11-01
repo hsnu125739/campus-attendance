@@ -1,6 +1,3 @@
-# campus-attendance
-這裡是小排點名系統的「GitHub Pages 專屬無橫幅入口」，完整說明如下：
-
 # 📋 小排點名網站 (Campus Attendance System)
 
 > **工程師速覽**：無框架原生 SPA（輕量 RWD）+ Google Apps Script (GAS) 後端 + Google Sheets 雲端資料庫。核心具備 0ms 樂觀響應、防抖背景同步、雙態回滾防護與 100% 離線單元測試。
@@ -25,7 +22,7 @@
 | **CampusStore** | `src/js/campus_store.js` | 小排管理狀態機（深拷貝快照比對、無實質變更防護、拖曳排序） |
 | **StatsAggregator** | `src/js/stats_aggregator.js` | 純領域資料運算（時間軸展開、**自動排除服事者/家長**、雙向次要排序打破） |
 | **Core** | `src/js/core.js` | 全域狀態實例化、RPC Promise 封裝 (`callServer`)、CampusDomain 領域規則 |
-| **UI Controllers** | `src/js/{campuses,attendance,stats,ui}.js` | DOM 渲染、Chart.js 圖表聯動與事件委派 |
+| **UI Controllers** | `src/js/{campuses,attendance,stats,ui}.js` | DOM 渲染、身分快速篩選與姓名即時搜尋、Chart.js 圖表聯動與事件委派 |
 | **SpreadsheetRepository** | `backup.gs` | 後端資料倉儲（5 欄點名架構、指數退避切片讀寫、跨表原子性更新） |
 | **GoogleSheetAdapter** | `backup.gs` | `LockService` 併發鎖排隊與 Sheet 原生 I/O 適配器 |
 
